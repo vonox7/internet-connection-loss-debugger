@@ -1,5 +1,7 @@
 # internet-connection-loss-debugger
 
+https://github.com/user-attachments/assets/4d031659-7afe-48c0-be07-ffb226895545
+
 Find out **where** packet loss and latency spikes on your internet connection come from:
 your Wi-Fi, your router, the line to your ISP, or the ISP's network. Built for macOS;
 needs only the Python 3 that ships with it.
