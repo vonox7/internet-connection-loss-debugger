@@ -218,3 +218,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# netdiag
+netdiag-logs/
+.DS_Store

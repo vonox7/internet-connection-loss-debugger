@@ -1,0 +1,116 @@
+# internet-connection-loss-debugger
+
+Find out **where** packet loss and latency spikes on your internet connection come from:
+your Wi-Fi, your router, the line to your ISP, or the ISP's network. Built for macOS;
+needs only the Python 3 that ships with it.
+
+Instead of pinging one host, `netdiag.py` probes every station on the path **at the same
+moment** — your home router, the first hops of your ISP, 1.1.1.1 and 8.8.8.8 (ICMP and TCP
+handshakes) — 20 times per second. Where the loss rate steps up and stays up for everything
+behind it is where packets get lost.
+
+## Quick start
+
+```sh
+git clone https://github.com/vonox7/internet-connection-loss-debugger.git
+cd internet-connection-loss-debugger
+./netdiag.py run          # live dashboard; Ctrl+C stops it and prints the report
+```
+
+Let it run for 30 minutes or more, ideally at a time when the connection feels bad.
+Everything (gateway, hops, Wi-Fi vs. Ethernet) is detected automatically, nothing is
+hardcoded, so you can hand the script to anyone.
+
+On macOS 15+, your terminal app needs the **Local Network** permission (System Settings →
+Privacy & Security → Local Network) to reach the router; the tool warns you if it's missing.
+
+## What you see while it runs
+
+- **Probes**: per station its loss, latency and a timeline with one column per second: the
+  bar shows how much slower than usual it answered (yellow █ = latency spike), the digit
+  below how many probes got lost in that second. A row flashes the moment a probe is lost.
+- **Regular loss intervals**: checks whether losses repeat on a fixed timer (every 1–300 s,
+  at the same moment of the cycle), with the moment, how tightly the losses cluster, how
+  fast the moment drifts, and how likely that pattern is pure luck. A device that runs a
+  periodic job and briefly stops forwarding shows up here.
+- **Events**: every loss / spike with time, duration and which stations were hit.
+  Scroll with ↑/↓, PgUp/PgDn, Home/End.
+
+## The report
+
+After Ctrl+C (or `-d SECONDS`) you get per-station statistics and findings, e.g.
+
+```
+⚠ VERDICT: loss is 0.00% up to home-router and 0.50% from hop2-isp on, and stays that
+  high for everything behind it, so packets are lost between home-router and hop2-isp:
+  your internet line between the home router and the ISP's first router …
+⚠ The losses recur on a fixed timer: every 30 s at :23.72 / :53.72, losses within
+  59 ms: 21 of 22 cycles (expected by chance: ~2) …
+```
+
+| loss starts at …              | means                                             |
+|-------------------------------|---------------------------------------------------|
+| the home router               | your Wi-Fi / LAN                                  |
+| the ISP's first hop           | your internet line (modem/ONT, fiber/cable, ISP access network) |
+| a later ISP hop               | inside the ISP's network                          |
+| only one intermediate hop     | that hop just rate-limits pings (harmless)        |
+
+Everything is saved in `netdiag-logs/<timestamp>/`: `report.txt`, `events.txt` /
+`events.json` (all events), `probes.csv` (every single probe), `traceroute.txt`,
+`summary.json`. These files contain your IP addresses, so check them before sharing.
+
+Compare several runs (different times of day) with:
+
+```sh
+./netdiag.py summarize      # also writes netdiag-logs/summary.md
+```
+
+## Options
+
+```
+./netdiag.py run -i 0.2            # probe every 200 ms instead of 50 ms
+./netdiag.py run -d 1800           # stop after 30 minutes
+./netdiag.py run --link ethernet   # skip Wi-Fi / Ethernet detection
+./netdiag.py run --ont 192.168.100.1   # a separate ONT/modem with its own IP before the router
+./netdiag.py run --hops 8 --hosts 1.1.1.1 9.9.9.9
+./netdiag.py run --no-tcp          # ICMP only
+./netdiag.py analyze ping-log.txt  # analyze a saved `ping` output
+```
+
+## Testing without your router: `ont-connect.sh`
+
+If the loss starts right after your router, the next question is: the router, or the line?
+`ont-connect.sh` connects the Mac directly to the fiber ONT (or modem) and does the
+router's job itself:
+
+```sh
+./ont-connect.sh                  # asks for the ISP's internet VLAN
+./ont-connect.sh --vlan 7         # ISP delivers internet on VLAN 7
+./ont-connect.sh --no-vlan        # ISP delivers internet untagged
+./ont-connect.sh --browser        # also open the ONT's web page (optical levels, errors)
+```
+
+Unplug the router from the ONT, plug in the Mac, run the script. It reaches the ONT's
+management address (default `192.168.100.1`, change with `--ont`), gets an address from
+the ISP via DHCP (the VLAN ID is in your router's internet/WAN settings), and starts the
+analyzer in a new terminal window. Press Enter in the script's window when you're done:
+it restores your network settings. PPPoE connections aren't supported.
+
+If the ONT itself answers without loss but everything behind it loses packets, your own
+equipment is ruled out and the problem is on the line / ISP side.
+
+## How it works
+
+- Unprivileged ICMP sockets (no sudo) plus non-blocking TCP handshakes; all stations get
+  one probe per round at the same moment, so losses on a shared segment line up.
+- Localization like `mtr`, but with a check that two destinations losing in the same round
+  happens far more often than chance (real shared loss, not ICMP rate limiting).
+- Periodicity: for every interval and phase, counts cycles with a loss at that moment,
+  compares with random loss (binomial tail) and corrects for having searched all
+  intervals; validated against random-loss simulations.
+- Wi-Fi: link state through CoreWLAN without triggering scans (a scan itself causes
+  spikes); a neighbor scan only runs after the test, and only if the Wi-Fi hop lost packets.
+
+## License
+
+MIT
