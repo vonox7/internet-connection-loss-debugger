@@ -26,6 +26,8 @@ lost:
   only an intermediate hop lost        -> that hop rate-limits ICMP (not real loss)
 """
 import argparse
+import bisect
+import concurrent.futures
 import contextlib
 import errno
 import glob
@@ -34,6 +36,7 @@ import math
 import os
 import re
 import select
+import signal
 import shutil
 import socket
 import statistics
@@ -48,6 +51,8 @@ from collections import Counter, deque
 
 REPLY_RE = re.compile(r"icmp_seq=(\d+).*?time=([\d.]+) ms")
 TIMEOUT_RE = re.compile(r"Request timeout for icmp_seq (\d+)")
+# kernel receive timestamps (macOS values; Python doesn't export them)
+SO_TIMESTAMP, SCM_TIMESTAMP = getattr(socket, "SO_TIMESTAMP", 0x400), getattr(socket, "SCM_TIMESTAMP", 2)
 
 # Path order of targets. Traced hop N gets rank RANK_HOP + N.
 RANK_ROUTER, RANK_ONT, RANK_HOP, RANK_DEST = 0, 1, 10, 100
@@ -654,12 +659,20 @@ class Prober:
         self.by_ident = {self.idents[t.name]: t for t in targets}
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_ICMP)
         self.sock.settimeout(0.2)
+        # the kernel stamps each reply on arrival, so the RTT stays exact even when this
+        # process reads it late; a big buffer holds replies while it's busy
+        self.sock.setsockopt(socket.SOL_SOCKET, SO_TIMESTAMP, 1)
+        self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 20)
+        self.expired = {}      # (ident, wire_seq) -> wall send time, of probes declared lost
+        self.misread = []      # wall times of replies that came in time but were read too late
         self.send_t = []       # wall-clock send time per round
         self.pending = {}      # (ident, wire_seq) -> (round, perf_counter at send)
         self.tcp_pending = {}  # socket -> (target, round, perf_counter at send)
         self.lock = threading.Lock()
         self.stop = threading.Event()
         self.start_t = None
+        self.slept = None      # (wall time asleep, wall time awake) if the Mac slept
+        self.keep = None       # rounds still valid after a sleep
 
     def run(self):
         threading.Thread(target=self._recv_loop, daemon=True).start()
@@ -676,8 +689,20 @@ class Prober:
                 time.sleep(wait)
             elif wait < -self.interval:
                 t0 -= wait     # fell behind: resume from now instead of bursting to catch up
+            if self.send_t and (time.time() - self.send_t[-1]) - (time.perf_counter() - last) > 5:
+                # The Mac slept (lid closed, empty battery): the wall clock jumped while
+                # perf_counter stood still. Rounds around the sleep would count as lost,
+                # so keep only those that finished well before it, and stop the test.
+                with self.lock:
+                    asleep = self.send_t[-1]
+                    self.slept = (asleep, time.time())
+                    self.keep = bisect.bisect_left(self.send_t, asleep - self.timeout - 2)
+                self.stop.set()
+                break
+            last = time.perf_counter()
             seq = n & 0xFFFF
-            payload = struct.pack("!d", time.time()) + b"netdiag-probe-pad"
+            wall = time.time()
+            payload = struct.pack("!d", wall) + b"netdiag-probe-pad"
             with self.lock:
                 self.send_t.append(time.time())
                 for t in self.targets:
@@ -688,7 +713,7 @@ class Prober:
                     ident = self.idents[t.name]
                     hdr = struct.pack("!BBHHH", 8, 0, 0, ident, seq)
                     pkt = struct.pack("!BBHHH", 8, 0, icmp_checksum(hdr + payload), ident, seq) + payload
-                    self.pending[(ident, seq)] = (n, time.perf_counter())
+                    self.pending[(ident, seq)] = (n, time.time())    # right before sending
                     try:
                         self.sock.sendto(pkt, (t.addr, 0))
                     except OSError:
@@ -738,11 +763,15 @@ class Prober:
 
     def _expire(self, n):
         cutoff = n - int(self.timeout / self.interval) - 1
-        for key, (rnd, _) in list(self.pending.items()):
+        for key, (rnd, sent) in list(self.pending.items()):
             if rnd <= cutoff:
                 del self.pending[key]
+                self.expired[key] = sent
                 t = self.by_ident[key[0]]
                 t.rtt[rnd], t.lost_at = None, time.time()
+        if n % 100 == 0:       # forget expired probes after 10 s (wire seqs wrap around)
+            old = time.time() - 10
+            self.expired = {k: v for k, v in self.expired.items() if v > old}
         for s, (t, rnd, _) in list(self.tcp_pending.items()):
             if rnd <= cutoff:
                 del self.tcp_pending[s]
@@ -752,12 +781,16 @@ class Prober:
     def _recv_loop(self):
         while not self.stop.is_set():
             try:
-                data, _ = self.sock.recvfrom(2048)
+                data, anc, _, _ = self.sock.recvmsg(2048, 64)
             except socket.timeout:
                 continue
             except OSError:
                 continue
-            now = time.perf_counter()
+            now = time.time()
+            for lvl, typ, d in anc:
+                if lvl == socket.SOL_SOCKET and typ == SCM_TIMESTAMP and len(d) >= 12:
+                    sec, usec = struct.unpack("qi", d[:12])
+                    now = sec + usec / 1e6
             ihl = (data[0] & 0x0F) * 4 if data and data[0] >> 4 == 4 else 0
             if len(data) < ihl + 8:
                 continue
@@ -768,7 +801,13 @@ class Prober:
             with self.lock:
                 p = self.pending.pop((ident, seq), None)
                 if p is None:
-                    t.late += 1
+                    sent = self.expired.pop((ident, seq), None)
+                    if sent is not None and now - sent < self.timeout:
+                        # answered in time, but this Mac was too busy to read it before the
+                        # timeout: the tool's fault, not the network's
+                        self.misread.append(sent)
+                    else:
+                        t.late += 1
                     continue
                 t.rtt[p[0]] = (now - p[1]) * 1000
 
@@ -778,7 +817,8 @@ class Prober:
             n = len(self.send_t)
             if not n:
                 return 0
-            return max(0, n - int(self.timeout / self.interval) - 1)
+            done = max(0, n - int(self.timeout / self.interval) - 1)
+            return done if self.keep is None else min(done, self.keep)
 
 
 # ---------------------------------------------------------------- event classification
@@ -922,6 +962,7 @@ class EventTracker:
         self.base = {}              # target name -> rolling p50
         self.dead = set()           # targets that don't answer at all (ignored)
         self.loss_t = []            # send times of rounds where something was lost
+        self.lost = Counter()       # target name -> lost probes so far
         self.periodic, self._period_at = None, 0
         self.scroll, self.seen, self.page = 0, 0, 1    # dashboard: events list position
 
@@ -937,6 +978,9 @@ class EventTracker:
                 # if nothing answered, that's an outage, not devices ignoring the probe type
                 if len(silent) < len(targets):
                     self.dead = silent
+            for t in targets:
+                if t.rtt[n] is None:
+                    self.lost[t.name] += 1
             alive = [t for t in targets if t.name not in self.dead]
             lost = [t for t in alive if t.rtt[n] is None]
             spiky = []
@@ -1080,6 +1124,8 @@ def odds(p):
     """A probability as "1 in N" with a readable N."""
     if p >= 0.5:
         return "likely luck"
+    if p < 1e-12:      # also catches p == 0 (underflow on very long runs)
+        return "1 in over a trillion"
     n = 1 / p
     for limit, word in ((1e12, "trillion"), (1e9, "billion"), (1e6, "million")):
         if n >= limit:
@@ -1126,30 +1172,50 @@ def interval_blocks(prober, tracker, use_color, window_s=300):
     # changes slowly): 1 min after 30 min
     every = max(5, (now - prober.send_t[0]) / 30) if prober.send_t else 5
     tracker._intervals_every = every
-    if cache and (now - cache[0] < every or (busy and busy.is_alive())):
+    if busy and busy.done():
+        try:
+            tracker._intervals = (tracker._intervals_at, _interval_blocks(busy.result(), use_color))
+        except Exception:
+            tracker._intervals_at = now     # keep showing the previous result
+        busy = tracker._intervals_busy = None
+        cache = tracker._intervals
+    if cache and (now - cache[0] < every or busy):
         return cache[1]
-    if cache is not None:
-        # long runs take a second or more to scan: do it in the background, keep drawing
-        tracker._intervals_busy = threading.Thread(
-            target=_interval_blocks, args=(prober, tracker, use_color, window_s, now), daemon=True)
-        tracker._intervals_busy.start()
-        return cache[1]
-    return _interval_blocks(prober, tracker, use_color, window_s, now)
-
-
-def _interval_blocks(prober, tracker, use_color, window_s, now):
     done = tracker.done
     end = prober.send_t[done - 1] if done else now
-    views = [("whole run", prober.send_t[0] if done else now)]
-    if done and end - prober.send_t[0] > 2 * window_s:   # the moment of a timer can drift
+    job = (list(tracker.loss_t), prober.send_t[0] if done else now, end, prober.interval, window_s)
+    if cache is not None:
+        # long runs take seconds to scan: do it in another process, so it neither holds up
+        # the drawing nor takes CPU time (the interpreter lock) from the probe threads
+        global _POOL
+        if _POOL is None:
+            _POOL = concurrent.futures.ProcessPoolExecutor(1, initializer=_ignore_sigint)
+        tracker._intervals_busy, tracker._intervals_at = _POOL.submit(scan_views, *job), now
+        return cache[1]
+    tracker._intervals = (now, _interval_blocks(scan_views(*job), use_color))
+    return tracker._intervals[1]
+
+
+_POOL = None
+
+
+def _ignore_sigint():
+    signal.signal(signal.SIGINT, signal.SIG_IGN)     # Ctrl+C is the main process's business
+
+
+def scan_views(loss_t, first, end, interval, window_s):
+    """Loss intervals for the whole run and, once it's long enough, the last `window_s`
+    seconds: [(label, start, end, interval, losses, candidates)]."""
+    views = [("whole run", first)]
+    if end - first > 2 * window_s:   # the moment of a timer can drift
         views.append((f"last {window_s // 60} min", end - window_s))
-    blocks = []
+    out = []
     for label, start in views:
-        times = [t for t in tracker.loss_t if t >= start]
+        times = [t for t in loss_t if t >= start]
         n = len([t for i, t in enumerate(times) if not i or t - times[i - 1] > 0.3])
         found = []
         while len(found) < 8:
-            cands = period_scan(times, start, end, prober.interval)
+            cands = period_scan(times, start, end, interval)
             if not cands or (len(found) >= 5 and not significance(cands[0])):
                 break       # the 5 best guesses, plus any further (possibly) significant ones
             cands[0]["drift"] = phase_drift(cands[0], times)
@@ -1159,6 +1225,13 @@ def _interval_blocks(prober, tracker, use_color, window_s, now):
             c = cands[0]
             P, ph = c["period"], c["phase"]
             times = [t for t in times if abs((t - ph + P / 2) % P - P / 2) > c["window"]]
+        out.append((label, start, end, interval, n, found))
+    return out
+
+
+def _interval_blocks(views, use_color):
+    blocks = []
+    for label, start, end, interval, n, found in views:
         sig = sum(1 for c in found if significance(c) == 2)
         maybe = sum(1 for c in found if significance(c) == 1)
         if not found:
@@ -1169,7 +1242,7 @@ def _interval_blocks(prober, tracker, use_color, window_s, now):
                 maybe and f"{maybe} possibly significant") if x)
         else:
             summary = "no statistically significant interval (best guesses below)"
-        lo, hi = 1 if prober.interval <= 0.2 else 5, int(min(300, (end - start) / 3))
+        lo, hi = 1 if interval <= 0.2 else 5, int(min(300, (end - start) / 3))
         checked = f"intervals {lo}–{hi} s checked" if hi >= lo and n >= 4 else "nothing checked yet"
         out = [color(f"{label}: {n} losses in {(end - start) / 60:.1f} min", "1", use_color)
                + color(f" · {checked}", GREY, use_color),
@@ -1193,7 +1266,6 @@ def _interval_blocks(prober, tracker, use_color, window_s, now):
                        f"{odds(c['p_adj']):<21}  "
                        + color(label, code, use_color))
         blocks.append(out)
-    tracker._intervals = (now, blocks)
     return blocks
 
 
@@ -1288,16 +1360,23 @@ def render(prober, tracker, link_desc, wifi_now, started, use_color, drawn):
     lines.append(f"{'hop':>3} {'address':<{aw}}{'loss':>8}{'last':>7}{'p50':>7}"
                  f"{'p95':>7}   last {spark_w}s · bar = ping above p50 (+5/10 ms, " + color(f"█ spike +{SPIKE_MS}", WARN, use_color) + ") · "
                  + color("digit", "1;31", use_color) + " = lost/s")
+    # percentiles of the recent replies, refreshed every 5 s: sorting them on every frame
+    # would eat the CPU time the probe threads need on long runs
+    cache = getattr(tracker, "_pcts", None)
+    if not cache or done - cache[0] >= 5 * per_col or done < cache[0]:
+        cache = tracker._pcts = (done, {})
+        for t in targets:
+            nums = sorted(v for v in t.rtt[max(0, done - 20000):done] if isinstance(v, float))
+            cache[1][t.name] = (pct(nums, 50), pct(nums, 95)) if nums else (None, None)
     for t in targets:
-        res = t.rtt[:done]
-        lost = sum(1 for v in res if v is None)
-        nums = sorted(v for v in res[-20000:] if isinstance(v, float))
-        last = next((v for v in reversed(res) if isinstance(v, float)), None)
-        p50 = pct(nums, 50) if nums else None
+        lost = tracker.lost[t.name]
+        last = next((t.rtt[i] for i in range(done - 1, max(-1, done - 200), -1)
+                     if isinstance(t.rtt[i], float)), None)
+        p50, p95 = cache[1][t.name]
         f = lambda v: f"{v:7.1f}" if v is not None else "      -"
-        loss = 100 * lost / len(res) if res else 0
+        loss = 100 * lost / done if done else 0
         ls = f"{loss:7.2f}%"
-        rest = f"{f(last)}{f(p50)}{f(pct(nums, 95) if nums else None)}"
+        rest = f"{f(last)}{f(p50)}{f(p95)}"
         left = f"{t.hop or '-':>3} {label(t):<{aw}}"
         if time.time() - t.lost_at < 0.15:
             # flash the row the moment a probe is declared lost (redrawn 10×/s)
@@ -1313,8 +1392,7 @@ def render(prober, tracker, link_desc, wifi_now, started, use_color, drawn):
                      + color("lost/s", GREY, use_color) + "   " + paint(lossc))
     lines.append("")
     blocks = interval_blocks(prober, tracker, use_color)
-    busy = getattr(tracker, "_intervals_busy", None)
-    if busy and busy.is_alive():
+    if getattr(tracker, "_intervals_busy", None):
         status = "recalculating…"
     else:
         age = time.time() - tracker._intervals[0]
@@ -1457,7 +1535,7 @@ def cmd_run(args):
             term = termios.tcgetattr(sys.stdin)
             ttymode.setcbreak(sys.stdin)
             threading.Thread(target=read_keys, args=(tracker, prober.stop), daemon=True).start()
-    last_plain = 0
+    last_plain = last_save = 0
     drawn = 0   # lines of the previous frame, redrawn in place so the last one stays visible
     try:
         while True:
@@ -1472,7 +1550,12 @@ def cmd_run(args):
                 print(f"{time.time() - started:6.0f}s  " + "  ".join(
                     f"{t.name}={sum(1 for v in t.rtt[:d] if v is None)}/{d}" for t in targets),
                     flush=True)
+            if time.time() - last_save >= 10:
+                last_save = time.time()
+                save_probes(prober, tracker.done, out_dir)
             if args.duration and time.time() - started >= args.duration:
+                break
+            if prober.slept:
                 break
     except KeyboardInterrupt:
         pass
@@ -1483,9 +1566,18 @@ def cmd_run(args):
             sys.stdout.write("\x1b[?25h")
             sys.stdout.flush()
     prober.stop.set()
+    if _POOL:
+        for proc in list(_POOL._processes.values()):    # don't wait for a running scan
+            proc.terminate()
+        _POOL.shutdown(wait=False, cancel_futures=True)
     if sampler:
         sampler.terminate()
     tracker.update()
+    if prober.slept:
+        asleep, awake = prober.slept
+        print(f"\nThe Mac was asleep from {time.strftime('%H:%M:%S', time.localtime(asleep))} "
+              f"to {time.strftime('%H:%M:%S', time.localtime(awake))}, so the test stopped "
+              "there. The report covers the time before the sleep.")
     if link == "wifi":
         # A neighbor scan takes the radio off-channel, so it only runs after the test, and
         # only when the Wi-Fi hop itself lost packets (otherwise Wi-Fi is ruled out anyway).
@@ -1528,6 +1620,20 @@ def report(prober, tracker, link, iface, full, link_samples, counters_before, ou
             write_summaries(prober, tracker, stats, info, link, setup, out_dir)
 
 
+def save_probes(prober, upto, out_dir):
+    """Append the finished rounds to probes.csv (during the run too, so a crash, a kill or
+    a dead battery doesn't lose the night's data)."""
+    start = getattr(prober, "saved", 0)
+    with open(os.path.join(out_dir, "probes.csv"), "a" if start else "w") as f:
+        if not start:
+            f.write("round,send_time," + ",".join(t.name for t in prober.targets) + "\n")
+        for n in range(start, upto):
+            f.write(f"{n},{prober.send_t[n]:.4f}," + ",".join(
+                f"{t.rtt[n]:.3f}" if isinstance(t.rtt[n], float) else "" for t in prober.targets)
+                    + "\n")
+    prober.saved = max(start, upto)
+
+
 def _report(prober, tracker, link, iface, full, link_samples, counters_before, out_dir, err_samples,
             info):
     done = tracker.done
@@ -1536,11 +1642,7 @@ def _report(prober, tracker, link, iface, full, link_samples, counters_before, o
         print("Stopped before any probe round completed.")
         return None
 
-    with open(os.path.join(out_dir, "probes.csv"), "w") as f:
-        f.write("round,send_time," + ",".join(t.name for t in targets) + "\n")
-        for n in range(done):
-            f.write(f"{n},{prober.send_t[n]:.4f}," + ",".join(
-                f"{t.rtt[n]:.3f}" if isinstance(t.rtt[n], float) else "" for t in targets) + "\n")
+    save_probes(prober, done, out_dir)
     with open(os.path.join(out_dir, "events.json"), "w") as f:
         json.dump([{**e, "targets": sorted(e["targets"])} for e in tracker.events], f, indent=1)
     with open(os.path.join(out_dir, "events.txt"), "w") as f:
@@ -1554,6 +1656,14 @@ def _report(prober, tracker, link, iface, full, link_samples, counters_before, o
     print(f"\nRan {dur / 60:.1f} min, {done} probe rounds every {prober.interval * 1000:.0f} ms. "
           f"Raw data: {out_dir}/")
     print(f"Command: {' '.join(['netdiag.py'] + sys.argv[1:])}")
+    if prober.slept:
+        print(f"Stopped early: the Mac went to sleep at "
+              f"{time.strftime('%H:%M:%S', time.localtime(prober.slept[0]))}.")
+    if prober.misread:
+        print(f"⚠ This Mac was too busy to read {len(prober.misread)} replies in time (first at "
+              f"{time.strftime('%H:%M:%S', time.localtime(prober.misread[0]))}): they arrived "
+              "within the timeout but count as lost, so ICMP loss is overstated. Close other "
+              "heavy apps and run again.")
     kinds = Counter(e["kind"] for e in tracker.events)
     print(f"Events: {kinds['loss']} loss, {kinds['spike']} latency spike, all listed in events.txt")
 
@@ -1626,7 +1736,7 @@ def write_summaries(prober, tracker, stats, info, link, setup, out_dir):
     summary = {"start": prober.send_t[0], "end": prober.send_t[done - 1], "rounds": done,
                "interval": prober.interval, "link": link, "setup": setup, "targets": rows,
                "verdict": info.get("verdict"), "shared": info.get("shared"),
-               "periodic": info.get("periodic"), "argv": sys.argv[1:]}
+               "periodic": info.get("periodic"), "slept": prober.slept, "misread": len(prober.misread), "argv": sys.argv[1:]}
     with open(os.path.join(out_dir, "summary.json"), "w") as f:
         json.dump(summary, f, indent=1)
 
