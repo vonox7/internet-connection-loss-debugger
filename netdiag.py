@@ -1108,7 +1108,10 @@ def vis_len(s):
 
 INTERVAL_HELP = (
     "A device on the path may run a job every few seconds that briefly loses packets. Every "
-    "interval in the range shown and every moment within it (phase, \"at\") is tried; "
+    "interval in the range shown and every moment within it is tried. \"when\" = at which moment of the "
+    "cycle the losses happen, as seconds of the clock: \"at :24.19 and :54.19 of every "
+    "minute\" = 12:00:24.19, 12:00:54.19, 12:01:24.19, …; intervals that don't fit evenly "
+    "into a minute show the clock time of their first loss. "
     "\"spread\" = how tightly the losses cluster around that moment; \"drift\" = how fast "
     "that moment moves (a device clock running slightly fast or slow; measured from 30 min); "
     "\"seen\" = in how many cycles there was a loss at that moment, \"expected\" = how many "
@@ -1213,9 +1216,9 @@ def scan_views(loss_t, first, end, interval, window_s):
     for label, start in views:
         times = [t for t in loss_t if t >= start]
         n = len([t for i, t in enumerate(times) if not i or t - times[i - 1] > 0.3])
-        found = []
+        found, masked = [], 0.0
         while len(found) < 8:
-            cands = period_scan(times, start, end, interval)
+            cands = period_scan(times, start, end, interval, masked=masked)
             if not cands or (len(found) >= 5 and not significance(cands[0])):
                 break       # the 5 best guesses, plus any further (possibly) significant ones
             cands[0]["drift"] = phase_drift(cands[0], times)
@@ -1225,6 +1228,9 @@ def scan_views(loss_t, first, end, interval, window_s):
             c = cands[0]
             P, ph = c["period"], c["phase"]
             times = [t for t in times if abs((t - ph + P / 2) % P - P / 2) > c["window"]]
+            # those losses' time is gone too, or the gaps left behind would make multiples
+            # of this interval look regular
+            masked = min(0.9, masked + 2 * c["window"] / P)
         out.append((label, start, end, interval, n, found))
     return out
 
@@ -1247,22 +1253,19 @@ def _interval_blocks(views, use_color):
         out = [color(f"{label}: {n} losses in {(end - start) / 60:.1f} min", "1", use_color)
                + color(f" · {checked}", GREY, use_color),
                "  " + summary]
+        ats = [moment_text(c["period"], c["phase"], start) for c in found]
+        aw = max([len(a) for a in ats] + [4])
         if found:
-            out.append(color("  every  at (phase)       spread  drift       seen        expected    chance it's just luck  result",
-                             GREY, use_color))
-        for c in found:
-            sec = wall_seconds(c)
-            at = ("/".join(f":{x:05.2f}" for x in sec) if sec and len(sec) <= 2 else
-                  f":{sec[0]:05.2f}+{c['period']}s" if sec else
-                  # no fixed second of the minute: give the clock time of the first one
-                  clock(start + (c["phase"] - start) % c["period"], 2))
+            out.append(color(f"  every  {'when':<{aw}} spread  drift       seen        "
+                             "expected    chance it's just luck  result", GREY, use_color))
+        for c, at in zip(found, ats):
             label, code = SIGNIFICANCE[significance(c)]
             exp = c["expected"]
             hit = f"{c['hits']:>3} of {c['cycles']:<4}  ~{exp:.0f}" if exp >= 1 else \
                 f"{c['hits']:>3} of {c['cycles']:<4}  <1"
             d = c.get("drift")
             drift = f"{'-' if d is None else 'none' if d == 0 else f'{d * 1000:+.0f} ms/h':<10}"
-            out.append(f"  {c['period']:>3} s  {at:<14} {c['spread'] * 1000:>4.0f} ms  {drift}  {hit:<21}   "
+            out.append(f"  {c['period']:>3} s  {at:<{aw}} {c['spread'] * 1000:>4.0f} ms  {drift}  {hit:<21}   "
                        f"{odds(c['p_adj']):<21}  "
                        + color(label, code, use_color))
         blocks.append(out)
@@ -1847,12 +1850,14 @@ def binom_tail(n, k, p):
     return min(1.0, math.exp(first) * total)
 
 
-def period_scan(times, start, end, interval=0.05, max_period=300):
+def period_scan(times, start, end, interval=0.05, max_period=300, masked=0.0):
     """Candidate loss intervals, most convincing first.
 
     `times` are the send times of rounds with a loss. For each whole-second period, find
     the phase window that the most cycles have a loss in, and how unlikely that many hits
-    would be with random loss (`p`). Phases come from the epoch, so they match the wall clock."""
+    would be with random loss (`p`). Phases come from the epoch, so they match the wall clock.
+    `masked`: share of the time whose losses were taken out (already explained by another
+    interval), so the remaining ones happened in the rest of the time."""
     dur = end - start
     bursts = []
     for t in sorted(times):        # a drop spanning a few rounds counts once
@@ -1862,12 +1867,16 @@ def period_scan(times, start, end, interval=0.05, max_period=300):
         return []
     # intervals under 5 s need fine sampling to see where in the cycle a loss falls
     periods = range(1 if interval <= 0.2 else 5, int(min(max_period, dur / 3)) + 1)
-    rate = len(bursts) / dur
+    rate = len(bursts) / (dur * (1 - masked))
     found = []
     tests = 0
     for P in periods:
         w = min(0.5, P / 8)         # the matching window shrinks for short intervals
-        p_cycle = 1 - math.exp(-rate * w)   # chance a cycle has a loss in a window
+        # chance a cycle has a loss in the window. Probes go out on a fixed grid, so a loss
+        # can only fall on a probe moment, and a window placed on one covers up to w /
+        # interval + 1 of them: count it as one probe interval wider (or a 100 ms grid
+        # turns random loss into a "significant" 1 s pattern).
+        p_cycle = 1 - math.exp(-rate * (w + interval))
         tests += min(P / w, len(bursts))   # windows tried: one per loss, at most P / w distinct
         # (phase in the cycle, cycle number); the copy shifted by one cycle lets a window
         # wrap around the end of the cycle
@@ -1913,6 +1922,7 @@ def find_period(times, start, end, interval, max_period=300):
                         if abs((t - ph0 + P / 2) % P - P / 2) <= w / 2) / len(times)
     # wall-clock seconds (time zones are whole minutes, so epoch seconds mod 60 match)
     best["seconds"] = wall_seconds(best)
+    best["start"] = start
     best["drift"] = phase_drift(best, sorted(times))
     return best
 
@@ -1923,9 +1933,24 @@ def wall_seconds(c):
     return sorted((c["phase"] + k * P) % 60 for k in range(60 // P)) if 60 % P == 0 else None
 
 
+def moment_text(P, phase, start):
+    """When in its cycle a timer hits, in words. Phases count from the epoch, so cycles that
+    fit into a minute start on the full minute."""
+    if P == 1:
+        frac = f"{phase % 1:.2f}"[1:]       # ".27"
+        return f"at :00{frac}, :01{frac}, :02{frac}, …"
+    if 60 % P == 0 and P >= 30:
+        return "at " + " and ".join(f":{(phase + k * P) % 60:05.2f}" for k in range(60 // P)) + " of every minute"
+    if 60 % P == 0:
+        return f"at :{phase % P:05.2f}, :{phase % P + P:05.2f}, :{phase % P + 2 * P:05.2f}, …"
+    # doesn't fit evenly into a minute: name the first one by the clock
+    if start is None:      # summary.json from an older version
+        return f"at phase {phase:.2f} s"
+    return f"first at {clock(start + (phase - start) % P, 2)}, then every {P} s"
+
+
 def period_text(per):
-    when = (" at " + " / ".join(f":{x:05.2f}" for x in per["seconds"])
-            if per["seconds"] else f" (phase {per['phase']:.2f} s)")
+    when = f", {moment_text(per['period'], per['phase'], per.get('start'))}"
     spread = f", losses within {per['spread'] * 1000:.0f} ms" if "spread" in per else ""
     if per.get("drift"):
         spread += f", the moment drifts {per['drift'] * 1000:+.0f} ms per hour"
