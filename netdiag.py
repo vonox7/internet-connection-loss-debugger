@@ -1883,8 +1883,12 @@ def trends(prober, tracker, link_samples=()):
         groups.append(("Measurement", "ms", [("worst read delay", per_bucket(
             [(m + 30, b) for m, _, b, _ in prober.quality if m], lambda v: max(x[1] for x in v)))]))
     loss = ("Loss per destination", "TCP to the destinations", "Latency", "Direction")
-    return [(title, unit, [(label, vals) for label, vals in rows if vals],
-             "loss" if title.startswith(loss) else "tests") for title, unit, rows in groups]
+    out = []
+    for title, unit, rows in groups:
+        rows = [(label, vals) for label, vals in rows if vals]
+        if rows:        # a topic without any data yet is left out
+            out.append((title, unit, rows, "loss" if title.startswith(loss) else "tests"))
+    return out
 
 
 SERIES_COLORS = ("36", "35", "34", "32", "33", "37")   # the series of a trend chart
@@ -2735,8 +2739,19 @@ class Replay:
         with contextlib.suppress(OSError, ValueError):
             with open(os.path.join(folder, "quality.csv")) as f:
                 next(f)
-                self.quality = [[0, float(a), float(b), int(c)] for _, a, b, c in
-                                (line.strip().split(",") for line in f if line.strip())]
+                # minutes are saved as local HH:MM: back to times, counting days from the start
+                lt = time.localtime(self.send_t[0])
+                day = self.send_t[0] - lt.tm_hour * 3600 - lt.tm_min * 60 - lt.tm_sec
+                prev = 0
+                for line in f:
+                    if not line.strip():
+                        continue
+                    hm, a, b, c = line.strip().split(",")
+                    m = day + int(hm[:2]) * 3600 + int(hm[3:5]) * 60
+                    while m < max(prev, self.send_t[0] - 60):
+                        m += 86400
+                    self.quality.append([m, float(a), float(b), int(c)])
+                    prev = m
         per_round = sum(60 if t.port else (t.size or (48 if t.v6 else 20) + 8 + 25)
                         for t in self.targets)
         self.probe_kbps = per_round * 8 / 1000 / self.interval
