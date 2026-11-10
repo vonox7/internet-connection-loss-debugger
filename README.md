@@ -7,8 +7,9 @@ your Wi-Fi, your router, the line to your ISP, or the ISP's network. Built for m
 needs only the Python 3 that ships with it.
 
 Instead of pinging one host, `netdiag.py` probes every station on the path **at the same
-moment** — your home router, the first hops of your ISP, 1.1.1.1 and 8.8.8.8 (ICMP and TCP
-handshakes) — 20 times per second. Where the loss rate steps up and stays up for everything
+moment** — your home router, the first hops of your ISP, and four destinations that a
+typical ISP reaches over different exits (Cloudflare 1.1.1.1, Google 8.8.8.8, OpenDNS
+208.67.222.222, Wikipedia 185.15.58.224; ICMP and TCP handshakes) — 20 times per second. Where the loss rate steps up and stays up for everything
 behind it is where packets get lost.
 
 ## Quick start
@@ -28,20 +29,53 @@ Privacy & Security → Local Network) to reach the router; the tool warns you if
 
 ## What you see while it runs
 
-- **Probes**: per station its loss, latency and a timeline with one column per second: the
-  bar shows how much slower than usual it answered (yellow █ = latency spike), the digit
-  below how many probes got lost in that second. A row flashes the moment a probe is lost.
-- **Loss over time**: a chart with one column per 10 minutes (coarser on long runs, up to
-  24 h) and the loss per hour, split into the regular timers found below and the random
-  rest. Loss that rises and falls with the time of day (high in the evening, low at 3 am)
-  points to an overloaded network rather than a damaged line.
+The tool runs full screen (like `top`; your terminal comes back as it was when it ends). A
+startup screen ticks off each preparation step (connection, route, TCP ports, extra probes,
+clock), then six views take over, switched with ← / → or `1`–`6` (tabs at the top):
+
+**1 Live** — what's happening right now?
+- **Probes**: per station its loss (for TCP also "resent": a packet got lost, but TCP's
+  resend got through, as it does for real traffic), latency and a timeline with one column
+  per second: the bar shows how much slower than usual it answered (yellow █ = latency
+  spike), the digit below how many probes got lost in that second. A row flashes the moment
+  a probe is lost.
+- **Events**: every loss / spike with time, duration and which stations were hit; losses at
+  the moment of a regular timer say so ("30 s timer"). Scroll with ↑/↓, PgUp/PgDn, Home/End.
+
+**2 Timeline** — when does it happen?
+- **Loss over time**: per protocol a chart with one column per 10 minutes (coarser on long
+  runs, up to 24 h) and the loss per hour: ICMP split into the regular timers found below
+  and the random rest, TCP into resent and lost. Loss that rises and falls with the time of
+  day (high in the evening, low at 3 am) points to an overloaded network rather than a
+  damaged line.
 - **Regular loss intervals**: checks whether losses repeat on a fixed timer (every 1–300 s,
   at the same moment of the cycle), with the moment, how tightly the losses cluster, how
   fast the moment drifts, and how likely that pattern is pure luck. A device that runs a
-  periodic job and briefly stops forwarding shows up here. Press `h` for an explanation
-  of the columns.
-- **Events**: every loss / spike with time, duration and which stations were hit.
-  Scroll with ↑/↓, PgUp/PgDn, Home/End.
+  periodic job and briefly stops forwarding shows up here. Press `h` for an explanation.
+
+**3 Tests** — what kind of loss is it? Each with an explanation, a statistical verdict and
+its probes next to the normal ones they're compared with:
+- *direction*: a server that resends a lost reply sooner than macOS resends a lost request
+  (Google: ~0.3 s vs ~1 s) shows whether packets get lost on the way to you or from you;
+- *packet size*: 1400-byte vs small pings. Bit errors on a line hit big packets more often,
+  an overloaded queue drops both alike;
+- *priority marking*: pings marked EF / AF41 / CS1 vs unmarked, to the ISP's first hop;
+- *IPv4 vs IPv6*: a different path through the ISP (no carrier-grade NAT);
+- *your own traffic*: was the line quiet when packets got lost?
+
+**4 Trends / 5 Test trends** — what changed over the run, and what didn't? (Made for the
+morning after a night run.) One chart per topic, in the style of the loss-over-time chart,
+with its series as grouped bars (e.g. small and big packets side by side per time slot),
+and per series the first and the last hour, the lowest and the highest hour, and whether
+start and end differ (with a statistical test for the loss rates). *Trends*: loss per
+destination, TCP resent / lost, latency, direction. *Test trends*: packet size, priority
+marking, IPv4 vs IPv6, your own traffic, Wi-Fi signal, route changes, measurement quality.
+The report has the same section.
+
+**6 Raw** — can the measurement be trusted? TTL (a change = a new route) and marking of the
+replies per station, this Mac's traffic and interface errors, the tool's own delays, and how
+far the Mac's clock is off (checked against time.apple.com at the start and the end; the
+timer moments are measured on it).
 
 ## The report
 
@@ -62,14 +96,26 @@ After Ctrl+C (or `-d SECONDS`) you get per-station statistics and findings, e.g.
 | a later ISP hop               | inside the ISP's network                          |
 | only one intermediate hop     | that hop just rate-limits pings (harmless)        |
 
-Everything is saved in `netdiag-logs/<timestamp>/`: `report.txt`, `events.txt` /
-`events.json` (all events), `probes.csv` (every single probe), `traceroute.txt`,
-`summary.json`. These files contain your IP addresses, so check them before sharing.
+Everything is saved in `netdiag-logs/<timestamp>/` (during the run too): `report.txt`,
+`events.txt` / `events.json` (all events), `probes.csv` (every single probe),
+`traceroute.txt`, `traffic.csv` (this Mac's traffic and interface errors per
+second), `quality.csv` (the tool's own delays per minute), `paths.txt` (TTL changes and
+reply markings), `summary.json`. These files contain your IP addresses, so check them before sharing.
 
 Compare several runs (different times of day) with:
 
 ```sh
 ./netdiag.py summarize      # also writes netdiag-logs/summary.md
+```
+
+One row per run: loss at your first device, at the ISP's first hop and on the internet
+(ICMP; TCP split into resent and lost), where the loss starts, the regular timers found and
+the test results.
+
+Analyze a saved run again with the current version (e.g. after an update of the tool):
+
+```sh
+./netdiag.py report netdiag-logs/20261109-231641   # keeps the old one as report.before.txt
 ```
 
 ## Options
@@ -81,6 +127,9 @@ Compare several runs (different times of day) with:
 ./netdiag.py run --ont 192.168.100.1   # a separate ONT/modem with its own IP before the router
 ./netdiag.py run --hops 8 --hosts 1.1.1.1 9.9.9.9
 ./netdiag.py run --no-tcp          # ICMP only
+./netdiag.py run --no-extra        # without the big / marked / IPv6 extra probes
+./netdiag.py run --status-cmd 'CMD' # log CMD's output every 5 min (status.txt), e.g. a
+                                   # script that reads your ONT's optical values
 ./netdiag.py analyze ping-log.txt  # analyze a saved `ping` output
 ```
 

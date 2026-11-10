@@ -26,11 +26,14 @@ lost:
   only an intermediate hop lost        -> that hop rate-limits ICMP (not real loss)
 """
 import argparse
+import atexit
 import bisect
 import concurrent.futures
 import contextlib
+import csv
 import errno
 import glob
+import itertools
 import json
 import math
 import os
@@ -53,9 +56,21 @@ REPLY_RE = re.compile(r"icmp_seq=(\d+).*?time=([\d.]+) ms")
 TIMEOUT_RE = re.compile(r"Request timeout for icmp_seq (\d+)")
 # kernel receive timestamps (macOS values; Python doesn't export them)
 SO_TIMESTAMP, SCM_TIMESTAMP = getattr(socket, "SO_TIMESTAMP", 0x400), getattr(socket, "SCM_TIMESTAMP", 2)
+IPV6_HOPLIMIT, IPV6_TCLASS = getattr(socket, "IPV6_HOPLIMIT", 47), getattr(socket, "IPV6_TCLASS", 36)
 
 # Path order of targets. Traced hop N gets rank RANK_HOP + N.
 RANK_ROUTER, RANK_ONT, RANK_HOP, RANK_DEST = 0, 1, 10, 100
+# A TCP probe answered only after a resend (by the server or by macOS): a packet was lost,
+# but TCP recovered it. Stored in Target.rtt next to float (answered) and None (lost).
+RESENT = "resent"
+# well-known destinations, named in the dashboard
+KNOWN_HOSTS = {"1.1.1.1": "Cloudflare", "8.8.8.8": "Google", "208.67.222.222": "OpenDNS",
+               "185.15.58.224": "Wikipedia", "9.9.9.9": "Quad9"}
+
+
+def is_lost(v):
+    """A lost packet: no answer, or one that TCP had to resend."""
+    return v is None or v is RESENT
 
 
 # ---------------------------------------------------------------- parsing
@@ -115,12 +130,15 @@ def find_modes(rtts, bin_ms=0.5):
 
 
 def analyze_series(samples, interval_s=1.0):
+    resent = sum(1 for v in samples.values() if v is RESENT)
+    if resent:      # a TCP resend means a lost packet: count it as one, and say so apart
+        samples = {s: None if v is RESENT else v for s, v in samples.items()}
     seqs = list(samples)
     rtts = [v for v in samples.values() if v is not None]
     lost = [s for s, v in samples.items() if v is None]
     n = len(seqs)
     r = {"sent": n, "recv": len(rtts), "lost": len(lost),
-         "loss_pct": 100 * len(lost) / n if n else 0.0, "lost_seqs": lost}
+         "loss_pct": 100 * len(lost) / n if n else 0.0, "lost_seqs": lost, "resent": resent}
     if not rtts:
         return r
     srt = sorted(rtts)
@@ -184,6 +202,10 @@ def print_series(name, r):
         return
     print(f"  packets   {r['sent']} sent, {r['recv']} received, "
           f"{r['lost']} lost ({r['loss_pct']:.2f}%)")
+    if r.get("tcp"):
+        n = r["sent"]
+        print(f"  TCP       of the lost: {r['resent']} answered after a resend ({100 * r['resent'] / n:.2f}%), "
+              f"{r['lost'] - r['resent']} never ({100 * (r['lost'] - r['resent']) / n:.2f}%)")
     if "p50" not in r:
         return
     print(f"  latency   min {r['min']:.1f} / p50 {r['p50']:.1f} / p90 {r['p90']:.1f} / "
@@ -406,8 +428,21 @@ def detect_link(iface, forced):
     return "wifi"
 
 
+def clock_offset():
+    """How far this Mac's clock is off (seconds, + = ahead), from time.apple.com; None if
+    it can't be reached. The timer moments and their drift are measured on this clock."""
+    try:
+        out = subprocess.run(["sntp", "-t", "3", "time.apple.com"], capture_output=True,
+                             text=True, timeout=10).stdout
+        m = re.search(r"^([+-]\d+\.\d+) \+/- (\d+\.\d+)", out, re.M)
+        # sntp prints how much to correct the clock by: the clock is off by the opposite
+        return (-float(m.group(1)), float(m.group(2))) if m else None
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
 def iface_counters(iface):
-    out = subprocess.run(["netstat", "-I", iface], capture_output=True, text=True).stdout.splitlines()
+    out = subprocess.run(["netstat", "-b", "-I", iface], capture_output=True, text=True).stdout.splitlines()
     if len(out) < 2:
         return None
     hdr = out[0].split()
@@ -415,36 +450,77 @@ def iface_counters(iface):
     try:
         # rows may lack the Address column; count from the end
         get = lambda name: int(row[len(row) - (len(hdr) - hdr.index(name))])
-        return {"ierrs": get("Ierrs"), "oerrs": get("Oerrs"), "coll": get("Coll")}
+        return {"ierrs": get("Ierrs"), "oerrs": get("Oerrs"), "coll": get("Coll"),
+                "ibytes": get("Ibytes"), "obytes": get("Obytes")}
     except (ValueError, IndexError):
         return None
 
 
 def trace_hops(dest, max_hops):
-    """traceroute to dest. Returns (raw output, [(hop number, ip)])."""
-    out = subprocess.run(["traceroute", "-n", "-q", "1", "-w", "1", "-m", str(max_hops), dest],
-                         capture_output=True, text=True, timeout=60).stdout
-    hops = []
-    for line in out.splitlines():
-        m = re.match(r"\s*(\d+)\s+(\d+\.\d+\.\d+\.\d+)", line)
-        if m:
-            hops.append((int(m.group(1)), m.group(2)))
+    """traceroute to dest. Returns (raw output, [(hop number, ip)]). Many servers don't
+    answer traceroute's UDP packets at the end of the path: then it's redone with pings."""
+    for proto in ("udp", "icmp"):
+        out = subprocess.run(["traceroute", "-n", "-q", "1", "-w", "1", "-m", str(max_hops),
+                              "-P", proto, dest], capture_output=True, text=True, timeout=90).stdout
+        hops = []
+        for line in out.splitlines():
+            m = re.match(r"\s*(\d+)\s+(\d+\.\d+\.\d+\.\d+)", line)
+            if m:
+                hops.append((int(m.group(1)), m.group(2)))
+        if hops and hops[-1][1] == dest:
+            break
     return out, hops
 
 
-def trace_all(dests, max_hops=20):
-    """Trace every destination in parallel. Returns {dest: (raw output, hops)}."""
-    res = {}
+# priority markings (DSCP, in the TOS byte) of the extra probes: what each one asks for
+MARKINGS = (("EF", 0xB8, "voice, top priority"), ("AF41", 0x88, "video, high priority"),
+            ("CS1", 0x20, "background, lowest priority"))
+V6_HOSTS = {"2606:4700:4700::1111": "Cloudflare", "2001:4860:4860::8888": "Google"}
 
-    def one(d):
-        res[d] = trace_hops(d, max_hops)
 
-    threads = [threading.Thread(target=one, args=(d,)) for d in dests]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
-    return res
+def has_ipv6():
+    """Is there an IPv6 route to the internet? (connecting a UDP socket sends nothing)"""
+    try:
+        with socket.socket(socket.AF_INET6, socket.SOCK_DGRAM) as s:
+            s.connect((next(iter(V6_HOSTS)), 53))
+            return not s.getsockname()[0].startswith(("fe80", "fd", "fc"))
+    except OSError:
+        return False
+
+
+def trace6_hops(dest, max_hops=6):
+    out = subprocess.run(["traceroute6", "-n", "-q", "1", "-w", "1", "-m", str(max_hops), dest],
+                         capture_output=True, text=True, timeout=60).stdout
+    return [(int(m.group(1)), m.group(2)) for m in
+            (re.match(r"\s*(\d+)\s+([0-9a-f:]+:[0-9a-f:]*)\s", line) for line in out.splitlines()) if m]
+
+
+def extra_probes(targets, first_isp):
+    """Probes that answer side questions, next to the normal ones (see Target.extra):
+    big packets (bit errors on a line hit big packets more often than small ones; an
+    overloaded queue drops both alike), priority markings (does the ISP's traffic management
+    treat them differently?) and IPv6 (a different path through the ISP: no carrier-grade NAT)."""
+    out = []
+    hop = next((t for t in targets if RANK_HOP <= t.rank < RANK_DEST and not t.port), None)
+    dest = next((t for t in targets if t.rank == RANK_DEST and not t.port), None)
+    for base in (hop, dest):
+        if base:
+            out.append(Target(f"{base.name}·1400B", base.addr, base.rank, base.hop, size=1400,
+                              extra=True, label="big: 1400 bytes"))
+    if hop:
+        for mark, tos, what in MARKINGS:
+            out.append(Target(f"{hop.name}·{mark}", hop.addr, hop.rank, hop.hop, tos=tos, extra=True,
+                              label=f"{mark}: {what}"))
+    if has_ipv6():
+        hops = trace6_hops(next(iter(V6_HOSTS)))
+        isp = next((ip for n, ip in hops if n == first_isp), None)
+        if isp:
+            out.append(Target("v6-isp", isp, RANK_HOP + first_isp, first_isp, v6=True, extra=True,
+                              label="IPv6 ISP hop"))
+        for addr, name in V6_HOSTS.items():
+            out.append(Target(f"v6-{name.lower()}", addr, RANK_DEST, None, v6=True, extra=True,
+                              label=f"IPv6 {name}"))
+    return out
 
 
 def answers_echo(addrs):
@@ -503,18 +579,17 @@ def check_local_network_access(targets):
     directly attached networks, while /sbin/ping still works. Detect that and say so."""
     local = [t for t in targets if not t.port and t.rank < RANK_DEST and on_link(t.addr)]
     if not local:
-        return
+        return None
     ping_ok = answers_echo([t.addr for t in local])
     blocked = [(t, err) for t in local if t.addr in ping_ok
                for ok, err in [python_reaches(t.addr)] if not ok]
     if not blocked:
-        return
+        return None
     app = os.environ.get("TERM_PROGRAM", "your terminal app").replace("Apple_Terminal", "Terminal")
-    print(f"\n  ⚠ ping reaches {', '.join(t.addr for t, _ in blocked)}, but this program can't "
-          f"({blocked[0][1]}).\n"
-          f"    macOS is blocking local-network access for {app}. Allow it in System Settings →\n"
-          f"    Privacy & Security → Local Network, then restart {app} and run again.\n"
-          "    (Until then those hops show 100% loss and are left out of the analysis.)\n")
+    return (f"ping reaches {', '.join(t.addr for t, _ in blocked)}, but this program can't "
+            f"({blocked[0][1]}): macOS is blocking local-network access for {app}. Allow it in "
+            f"System Settings → Privacy & Security → Local Network, restart {app} and run again "
+            "(until then those hops show 100% loss and are left out of the analysis)")
 
 
 def physical_iface(iface):
@@ -637,12 +712,25 @@ def icmp_checksum(b):
 
 
 class Target:
-    def __init__(self, name, addr, rank, hop=None, port=None):
+    def __init__(self, name, addr, rank, hop=None, port=None, size=None, tos=0, v6=False,
+                 extra=False, label=None):
         self.name, self.addr, self.rank, self.hop = name, addr, rank, hop
         self.port = port       # None = ICMP echo, otherwise TCP connect to this port
-        self.rtt = []          # index = round; float ms, None = lost, absent = pending
+        self.size = size       # ICMP: IP packet size in bytes (default: small)
+        self.tos = tos         # IP TOS byte (priority marking) of the probes
+        self.v6 = v6           # ICMPv6 instead of ICMP
+        # extra probes (packet size, marking, IPv6) are compared in the analysis, but stay
+        # out of the loss localization, the events and the interval scan
+        self.extra = extra
+        self.label = label     # name shown in the dashboard
+        self.ttl = None        # TTL / hop limit of the last reply; changes = route changes
+        self.ttl_changes = []  # (wall time, new TTL)
+        self.reply_tos = Counter()   # TOS byte of the replies -> count
+        self.resend_ms = {}    # TCP: round -> handshake time of a resent one (direction)
+        self.rtt = []          # index = round; float ms, None = lost, RESENT, ... = pending
         self.late = 0          # replies that came after the timeout
         self.lost_at = 0       # wall time the last probe was declared lost (dashboard flash)
+        self.fastest = None    # fastest TCP handshake so far, ms
 
 
 class Prober:
@@ -650,8 +738,10 @@ class Prober:
     or a TCP handshake for targets with a port (measures what real traffic sees, even
     where ICMP is deprioritized)."""
 
-    def __init__(self, targets, interval, timeout=1.0):
+    def __init__(self, targets, interval, timeout=1.0, tcp_timeout=1.9):
         self.targets, self.interval, self.timeout = targets, interval, timeout
+        # a TCP probe waits for one resend (macOS resends the SYN after 1 s)
+        self.tcp_timeout = tcp_timeout if any(t.port for t in targets) else timeout
         # Each ICMP target gets its own identifier, so replies are matched by
         # (identifier, seq) and still count when a device answers from another address.
         base = os.getpid() & 0xFF00
@@ -663,6 +753,23 @@ class Prober:
         # process reads it late; a big buffer holds replies while it's busy
         self.sock.setsockopt(socket.SOL_SOCKET, SO_TIMESTAMP, 1)
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 20)
+        self.sock6 = None
+        if any(t.v6 for t in targets):
+            self.sock6 = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM, socket.IPPROTO_ICMPV6)
+            self.sock6.settimeout(0.2)
+            self.sock6.setsockopt(socket.SOL_SOCKET, SO_TIMESTAMP, 1)
+            self.sock6.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 20)
+            for opt in (socket.IPV6_RECVHOPLIMIT, getattr(socket, "IPV6_RECVTCLASS", 35)):
+                with contextlib.suppress(OSError):
+                    self.sock6.setsockopt(socket.IPPROTO_IPV6, opt, 1)
+        self.tos = 0           # TOS currently set on the ICMP socket
+        # the probes' own traffic in kbit/s, each direction: ICMP request and reply (IP +
+        # ICMP header + payload, or the big size); TCP SYN / RST out, SYN-ACK in (~60 bytes)
+        per_round = sum(60 if t.port else (t.size or (48 if t.v6 else 20) + 8 + 25) for t in targets)
+        self.probe_kbps = per_round * 8 / 1000 / interval
+        # measurement quality per minute: [minute start, worst send delay ms, worst read
+        # delay ms, replies read too late]
+        self.quality = []
         self.expired = {}      # (ident, wire_seq) -> wall send time, of probes declared lost
         self.misread = []      # wall times of replies that came in time but were read too late
         self.send_t = []       # wall-clock send time per round
@@ -672,10 +779,22 @@ class Prober:
         self.stop = threading.Event()
         self.start_t = None
         self.slept = None      # (wall time asleep, wall time awake) if the Mac slept
+        self.traffic = []      # (time, bytes in, bytes out, input errors) of this Mac, per second
+        self.status_runs = 0
+        self.clock_checks = []     # (time, offset s, uncertainty s) of this Mac's clock
         self.keep = None       # rounds still valid after a sleep
+
+    def _quality(self, now):
+        """This minute's row of the measurement quality log."""
+        m = now // 60 * 60
+        if not self.quality or self.quality[-1][0] != m:
+            self.quality.append([m, 0.0, 0.0, 0])
+        return self.quality[-1]
 
     def run(self):
         threading.Thread(target=self._recv_loop, daemon=True).start()
+        if self.sock6:
+            threading.Thread(target=self._recv_loop, args=(True,), daemon=True).start()
         threading.Thread(target=self._tcp_loop, daemon=True).start()
         threading.Thread(target=self._send_loop, daemon=True).start()
 
@@ -689,6 +808,9 @@ class Prober:
                 time.sleep(wait)
             elif wait < -self.interval:
                 t0 -= wait     # fell behind: resume from now instead of bursting to catch up
+            if wait < 0:
+                q = self._quality(time.time())
+                q[1] = max(q[1], -wait * 1000)
             if self.send_t and (time.time() - self.send_t[-1]) - (time.perf_counter() - last) > 5:
                 # The Mac slept (lid closed, empty battery): the wall clock jumped while
                 # perf_counter stood still. Rounds around the sleep would count as lost,
@@ -696,7 +818,7 @@ class Prober:
                 with self.lock:
                     asleep = self.send_t[-1]
                     self.slept = (asleep, time.time())
-                    self.keep = bisect.bisect_left(self.send_t, asleep - self.timeout - 2)
+                    self.keep = bisect.bisect_left(self.send_t, asleep - self.tcp_timeout - 2)
                 self.stop.set()
                 break
             last = time.perf_counter()
@@ -711,11 +833,21 @@ class Prober:
                         self._send_tcp(t, n)
                         continue
                     ident = self.idents[t.name]
-                    hdr = struct.pack("!BBHHH", 8, 0, 0, ident, seq)
-                    pkt = struct.pack("!BBHHH", 8, 0, icmp_checksum(hdr + payload), ident, seq) + payload
+                    # a big probe: pad to the IP packet size (20 bytes IP + 8 ICMP header)
+                    data = payload.ljust(t.size - 28, b"\0") if t.size else payload
+                    if t.v6:     # the kernel fills in the ICMPv6 checksum
+                        pkt, sock, dest = (struct.pack("!BBHHH", 128, 0, 0, ident, seq) + data,
+                                           self.sock6, (t.addr, 0, 0, 0))
+                    else:
+                        hdr = struct.pack("!BBHHH", 8, 0, 0, ident, seq)
+                        pkt, sock, dest = (struct.pack("!BBHHH", 8, 0, icmp_checksum(hdr + data),
+                                                       ident, seq) + data, self.sock, (t.addr, 0))
+                        if t.tos != self.tos:
+                            self.sock.setsockopt(socket.IPPROTO_IP, socket.IP_TOS, t.tos)
+                            self.tos = t.tos
                     self.pending[(ident, seq)] = (n, time.time())    # right before sending
                     try:
-                        self.sock.sendto(pkt, (t.addr, 0))
+                        sock.sendto(pkt, dest)
                     except OSError:
                         t.rtt[n] = None   # no route / network down
                         self.pending.pop((ident, seq), None)
@@ -727,6 +859,8 @@ class Prober:
         s.setblocking(False)
         # close with RST instead of FIN: no TIME_WAIT pile-up at 20 connections/s
         s.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+        if t.tos:
+            s.setsockopt(socket.IPPROTO_IP, socket.IP_TOS, t.tos)
         t0 = time.perf_counter()
         err = s.connect_ex((t.addr, t.port))
         if err not in (0, errno.EINPROGRESS):
@@ -756,9 +890,19 @@ class Prober:
                     err = s.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
                     # "connection refused" is an answer too: the packet made it there and back.
                     # A handshake that took >= 0.9 s only completed because the OS resent the
-                    # SYN after its 1 s timeout, i.e. the first SYN or SYN-ACK was lost.
-                    answered = err in (0, errno.ECONNREFUSED) and now - t0 < 0.9
-                    t.rtt[n] = (now - t0) * 1000 if answered else None
+                    # SYN after its 1 s timeout, i.e. the first SYN or SYN-ACK was lost. Some
+                    # servers (Google) resend a lost SYN-ACK after only ~300 ms: an answer
+                    # 250 ms slower than this target's fastest one is such a resend, too.
+                    # Both count as RESENT; no answer even after that is lost.
+                    ms = (now - t0) * 1000
+                    if err not in (0, errno.ECONNREFUSED):
+                        t.rtt[n], t.lost_at = None, time.time()
+                    elif ms < 900 and ms < (t.fastest or ms) + 250:
+                        t.fastest = min(t.fastest or ms, ms)
+                        t.rtt[n] = ms
+                    else:
+                        t.rtt[n], t.lost_at = RESENT, time.time()
+                        t.resend_ms[n] = ms      # when: tells whose resend it was
                     s.close()
 
     def _expire(self, n):
@@ -772,32 +916,50 @@ class Prober:
         if n % 100 == 0:       # forget expired probes after 10 s (wire seqs wrap around)
             old = time.time() - 10
             self.expired = {k: v for k, v in self.expired.items() if v > old}
+        cutoff = n - int(self.tcp_timeout / self.interval) - 1
         for s, (t, rnd, _) in list(self.tcp_pending.items()):
             if rnd <= cutoff:
                 del self.tcp_pending[s]
                 t.rtt[rnd], t.lost_at = None, time.time()
                 s.close()
 
-    def _recv_loop(self):
+    def _recv_loop(self, v6=False):
+        sock = self.sock6 if v6 else self.sock
         while not self.stop.is_set():
             try:
-                data, anc, _, _ = self.sock.recvmsg(2048, 64)
+                data, anc, _, _ = sock.recvmsg(4096, 256)
             except socket.timeout:
                 continue
             except OSError:
                 continue
-            now = time.time()
+            now = read = time.time()
+            ttl = tos = None
             for lvl, typ, d in anc:
                 if lvl == socket.SOL_SOCKET and typ == SCM_TIMESTAMP and len(d) >= 12:
                     sec, usec = struct.unpack("qi", d[:12])
                     now = sec + usec / 1e6
-            ihl = (data[0] & 0x0F) * 4 if data and data[0] >> 4 == 4 else 0
+                elif lvl == socket.IPPROTO_IPV6 and typ == IPV6_HOPLIMIT and d:
+                    ttl = d[0]
+                elif lvl == socket.IPPROTO_IPV6 and typ == IPV6_TCLASS and d:
+                    tos = d[0]
+            # IPv4 replies come with their IP header: TOS and TTL are in there
+            ihl = (data[0] & 0x0F) * 4 if not v6 and data and data[0] >> 4 == 4 else 0
+            if ihl:
+                tos, ttl = data[1], data[8]
             if len(data) < ihl + 8:
                 continue
             typ, _, _, ident, seq = struct.unpack("!BBHHH", data[ihl:ihl + 8])
             t = self.by_ident.get(ident)
-            if typ != 0 or t is None:
+            if typ != (129 if v6 else 0) or t is None:
                 continue
+            q = self._quality(read)
+            q[2] = max(q[2], (read - now) * 1000)
+            if ttl is not None and ttl != t.ttl:
+                if t.ttl is not None:
+                    t.ttl_changes.append((now, ttl))
+                t.ttl = ttl
+            if tos is not None:
+                t.reply_tos[tos] += 1
             with self.lock:
                 p = self.pending.pop((ident, seq), None)
                 if p is None:
@@ -806,6 +968,7 @@ class Prober:
                         # answered in time, but this Mac was too busy to read it before the
                         # timeout: the tool's fault, not the network's
                         self.misread.append(sent)
+                        self._quality(read)[3] += 1
                     else:
                         t.late += 1
                     continue
@@ -817,7 +980,7 @@ class Prober:
             n = len(self.send_t)
             if not n:
                 return 0
-            done = max(0, n - int(self.timeout / self.interval) - 1)
+            done = max(0, n - int(max(self.timeout, self.tcp_timeout) / self.interval) - 1)
             return done if self.keep is None else min(done, self.keep)
 
 
@@ -963,14 +1126,23 @@ class EventTracker:
         self.dead = set()           # targets that don't answer at all (ignored)
         self.loss_t = []            # send times of rounds where something was lost
         self.lost = Counter()       # target name -> lost probes so far
-        self.isp_loss = []          # (send time, share of the ISP-side targets that lost it)
+        self.resent = Counter()     # target name -> TCP probes answered only after a resend
+        self.hist = {t.name: {} for t in prober.targets}    # see update()
+        self.tz = time.localtime().tm_gmtoff      # buckets start on the local 10 minutes
+        # per round with a loss on the ISP side (after the home router / ONT): (send time,
+        # share of those targets) for ICMP lost, TCP lost and TCP resent
+        self.isp_loss = {"icmp": [], "tcp_lost": [], "tcp_resent": []}
         self.periodic, self._period_at = None, 0
         self.scroll, self.seen, self.page = 0, 0, 1    # dashboard: events list position
         self.show_help = False      # dashboard: the explanation of the interval table (h key)
+        self.view = 0               # dashboard: index into VIEWS (1-4, ←/→, Tab)
+        self.out_dir = ""
 
     def update(self):
         upto = self.p.done_rounds()
-        targets = self.p.targets
+        # the extra probes (packet size, marking, IPv6) only get counted, they stay out of
+        # the events and the loss analysis
+        targets = [t for t in self.p.targets if not t.extra]
         for n in range(self.done, upto):
             if n in (40, 200) or (n and n % 1000 == 0):
                 # a device that ignores this probe type would look like a permanent outage
@@ -980,11 +1152,26 @@ class EventTracker:
                 # if nothing answered, that's an outage, not devices ignoring the probe type
                 if len(silent) < len(targets):
                     self.dead = silent
-            for t in targets:
-                if t.rtt[n] is None:
+            # per 10 minutes and target: [rounds, lost, resent, resent quickly (by the server),
+            # RTTs in 0.5 ms bins], for the Trends view
+            b = int((self.p.send_t[n] + self.tz) // TREND_S)
+            for t in self.p.targets:
+                h = self.hist[t.name].get(b)
+                if h is None:
+                    h = self.hist[t.name][b] = [0, 0, 0, 0, Counter()]
+                h[0] += 1
+                v = t.rtt[n]
+                if v is None:
                     self.lost[t.name] += 1
+                    h[1] += 1
+                elif v is RESENT:
+                    self.resent[t.name] += 1
+                    h[2] += 1
+                    h[3] += t.resend_ms.get(n, 1000) < 900
+                elif isinstance(v, float):
+                    h[4][int(v * 2)] += 1          # 0.5 ms bins
             alive = [t for t in targets if t.name not in self.dead]
-            lost = [t for t in alive if t.rtt[n] is None]
+            lost = [t for t in alive if is_lost(t.rtt[n])]
             spiky = []
             for t in alive:
                 v = t.rtt[n]
@@ -997,10 +1184,14 @@ class EventTracker:
             if lost:
                 self.loss_t.append(self.p.send_t[n])
                 # ISP side = everything after the home router / ONT
-                isp = [t for t in alive if t.rank > RANK_ONT]
-                bad = sum(1 for t in isp if t.rtt[n] is None)
-                if bad:
-                    self.isp_loss.append((self.p.send_t[n], bad / len(isp)))
+                icmp = [t for t in alive if t.rank > RANK_ONT and not t.port]
+                tcp = [t for t in alive if t.rank > RANK_ONT and t.port]
+                for key, group, test in (("icmp", icmp, lambda v: v is None),
+                                         ("tcp_lost", tcp, lambda v: v is None),
+                                         ("tcp_resent", tcp, lambda v: v is RESENT)):
+                    bad = sum(1 for t in group if test(t.rtt[n]))
+                    if bad:
+                        self.isp_loss[key].append((self.p.send_t[n], bad / len(group)))
             self._feed("loss", n, lost, alive)
             self._feed("spike", n, spiky, alive)
             for name, w in self.windows.items():
@@ -1059,7 +1250,8 @@ def color(s, code, enabled):
 
 
 def probe_label(t):
-    return f"tcp:{t.port}" if t.port else "icmp"
+    kind = f"tcp:{t.port}" if t.port else "icmpv6" if t.v6 else "icmp"
+    return kind + (f", {t.size} bytes" if t.size else "") + (f", TOS 0x{t.tos:02x}" if t.tos else "")
 
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
@@ -1080,7 +1272,8 @@ def fit(line, width):
 
 def spark_cells(t, end, n_cols, per_col, base):
     """One column per second: (ping cells, loss cells). Ping = how far the highest RTT of
-    that second is above the target's median; loss = how many probes got lost (1-9, # for 10+)."""
+    that second is above the target's median; loss = how many probes got lost (1-9, # for 10+),
+    yellow if TCP resent all of them."""
     ping, loss = [], []
     for c in range(n_cols):
         a = end - (n_cols - c) * per_col
@@ -1090,8 +1283,9 @@ def spark_cells(t, end, n_cols, per_col, base):
             loss.append((" ", None))
             continue
         vals = t.rtt[max(0, a):b]
-        lost = sum(1 for v in vals if v is None)
-        loss.append((str(lost) if lost < 10 else "#", "1;31") if lost else (" ", None))
+        lost = sum(1 for v in vals if is_lost(v))
+        hard = any(v is None for v in vals)
+        loss.append((str(lost) if lost < 10 else "#", "1;31" if hard else WARN) if lost else (" ", None))
         nums = [v for v in vals if isinstance(v, float)]
         if not nums:
             ping.append((" ", None))
@@ -1125,8 +1319,8 @@ INTERVAL_HELP = (
     "anyway, if the same number of losses happened at random times. \"Chance it's just luck\" "
     "says how rarely random loss alone would produce the best pattern found (taking into "
     "account that all intervals were searched): 1 in 10 000 or rarer is statistically "
-    "significant, 1 in 1 000 possibly significant (a longer run will tell). Only those are "
-    "listed; without any, the best guess is shown.")
+    "significant, 1 in 1 000 possibly significant (a longer run will tell). The whole run lists "
+    "those plus the best guesses up to 4 rows; the last minutes only those, or the best guess.")
 
 
 def odds(p):
@@ -1257,13 +1451,22 @@ def _interval_blocks(views, use_color):
                 sig and f"{sig} statistically significant interval{'s' * (sig != 1)}",
                 maybe and f"{maybe} possibly significant") if x)
         else:
-            summary = "nothing statistically significant (best guess below)"
+            summary = ("nothing statistically significant (best guesses below)"
+                       if label == "whole run" else "nothing statistically significant (best guess below)")
         lo, hi = 1 if interval <= 0.2 else 5, int(min(300, (end - start) / 3))
         checked = f"intervals {lo}–{hi} s checked" if hi >= lo and n >= 4 else "nothing checked yet"
         out = [color(f"{label}: {n} losses in {(end - start) / 60:.1f} min", "1", use_color)
                + color(f" · {checked} · ", GREY, use_color) + summary]
-        # the (possibly) significant ones; without any, just the best guess
-        found = [c for c in found if significance(c)] or found[:1]
+        # the (possibly) significant ones; the whole run fills up to 4 rows with the best
+        # guesses, the last minutes show just the best guess without any
+        if label == "whole run":
+            keep = []
+            for c in found:
+                if significance(c) or len(keep) < 4:
+                    keep.append(c)
+            found = keep
+        else:
+            found = [c for c in found if significance(c)] or found[:1]
         ats = [moment_text(c["period"], c["phase"], start) for c in found]
         aw = max([len(a) for a in ats] + [4])
         if found:
@@ -1283,9 +1486,10 @@ def _interval_blocks(views, use_color):
     return blocks
 
 
-# blue: loss at a regular timer, in the loss-over-time chart. The terminal's own blue, like
-# the red: as text and as background it's the same color.
-TIMER_COLOR, TIMER_BG = "34", "44"
+# blue: loss at a regular timer, in the loss-over-time chart (the terminal's own blue).
+TIMER_COLOR = "34"
+# the bold red used everywhere, as a background: terminals show bold red as bright red
+RED_BG = "101"
 
 
 def at_timer(c, t):
@@ -1323,118 +1527,474 @@ def loss_by_time(losses, start, end, interval, timers, size):
     return buckets
 
 
-def loss_chart(losses, start, end, interval, timers, width, use_color, height=5, legend=True):
-    """Bar chart of the loss over time, one column per 10 min (coarser if that doesn't fit
-    `width`): average loss of the ISP-side targets; red = random (at the bottom), blue on top =
-    at one of `timers`."""
+def bucket_size(start, end, width):
+    """Seconds per chart column: 10 min, coarser if that many columns don't fit `width`."""
     for size in (600, 1200, 1800, 3600):
-        buckets = loss_by_time(losses, start, end, interval, timers, size)
-        if len(buckets) <= width - 9:
-            break
-    pct = [100 * b[2] / b[1] for b in buckets]
-    tpct = [100 * sum(b[3]) / b[1] for b in buckets]
-    top = max(pct) or 0.01
+        if (end - start) / size + 2 <= width - 9:
+            return size
+    return 3600
+
+
+def bar_chart(cols, start, use_color, height, axis, bottom, top, top_bg):
+    """Stacked bars, one per time bucket: cols = [(bucket start, total %, bottom part %)].
+    The bottom part in color `bottom`, the rest in `top`; where both meet inside a cell, the
+    bottom part is drawn on a `top_bg` background."""
+    peak = max(c[1] for c in cols) or 0.01
     rows = []
     for r in range(height - 1, -1, -1):
         row = ""
-        for p, tp in zip(pct, tpct):
-            tot = max(1 if p else 0, round(p / top * height * 8))
-            rnd = round((p - tp) / top * height * 8)
-            fill = min(8, max(0, tot - 8 * r))
-            rfill = min(8, max(0, rnd - 8 * r))
-            if fill == 8 and 0 < rfill < 8 and use_color:
-                # random part ends inside a full cell: red block on a blue background (the red
-                # is the usual bold red, which terminals don't use for backgrounds)
-                row += color(SPARK[rfill], f"1;31;{TIMER_BG}", True)
+        for _, p, bp in cols:
+            fill = min(8, max(0, max(1 if p else 0, round(p / peak * height * 8)) - 8 * r))
+            bfill = min(8, max(0, round(bp / peak * height * 8) - 8 * r))
+            if fill == 8 and 0 < bfill < 8 and use_color:
+                row += color(SPARK[bfill], f"{bottom};{top_bg}", True)
             elif fill:
-                row += color(SPARK[fill], "1;31" if 2 * rfill >= fill else TIMER_COLOR, use_color)
+                row += color(SPARK[fill], bottom if 2 * bfill >= fill else top, use_color)
             else:
                 row += " "
-        label = f"{top:5.2f}% ┤" if r == height - 1 else "       │"
+        label = f"{peak:5.2f}% ┤" if r == height - 1 else "       │"
         rows.append(color(label, GREY, use_color) + row)
-    if legend:
-        rows.append(color("       └" + "─" * len(buckets), GREY, use_color))
+    if axis:
+        rows.append(color("       └" + "─" * len(cols), GREY, use_color))
     # clock times under the columns that start a full hour, and the start if there's room
-    axis, free = [" "] * (len(buckets) + 8), 0
-    hours = [i for i, b in enumerate(buckets) if b[0] >= start and time.localtime(b[0]).tm_min == 0]
+    marks, free = [" "] * (len(cols) + 8), 0
+    hours = [i for i, c in enumerate(cols) if c[0] >= start and time.localtime(c[0]).tm_min == 0]
     if not hours or hours[0] >= 6:
         hours.insert(0, 0)
     for i in hours:
         if i >= free:
-            axis[8 + i:8 + i + 5] = time.strftime("%H:%M", time.localtime(max(buckets[i][0], start)))
+            marks[8 + i:8 + i + 5] = time.strftime("%H:%M", time.localtime(max(cols[i][0], start)))
             free = i + 6
-    rows.append(color("".join(axis).rstrip(), GREY, use_color))
-    if not legend:
-        return rows, size
-    names = ", ".join(f"every {c['period']} s" for c in timers)
-    rows.append("        " + color("█", "1;31", use_color) + " random loss   " + (
-        color("█", TIMER_COLOR, use_color) + f" at a regular timer ({names})" if timers else
-        color("no statistically significant timer found", GREY, use_color)))
-    return rows, size
+    rows.append(color("".join(marks).rstrip(), GREY, use_color))
+    return rows
 
 
-def hourly_rows(losses, start, end, interval, timers):
-    """Per local hour: (start, loss %, random %, [% per timer])."""
-    out = []
-    for b, rounds, lost, per in loss_by_time(losses, start, end, interval, timers, 3600):
-        out.append((max(b, start), 100 * lost / rounds, 100 * (lost - sum(per)) / rounds,
-                    [100 * n / rounds for n in per]))
-    return out
+TCP_RESENT_BG = "48;5;178"      # WARN as a background
 
 
-def loss_over_time(losses, start, end, interval, timers, cols, use_color, live):
-    """The loss-over-time section: chart, then the loss per hour split into the timers and
-    the rest (live: hours as columns, newest that fit; report: hours as rows)."""
+def loss_blocks(isp, start, end, interval, timers, size, use_color, live):
+    """ICMP and TCP loss of the ISP-side targets: [(title, chart columns, chart colors,
+    legend, [(row label, legend color, label color, [% per hour])], hour starts)].
+    ICMP is split into the regular timers and the rest, TCP into resent and lost."""
     sig = [c for c in timers if significance(c) == 2]
-    # live also shows the possibly significant ones (a longer run will tell), not the guesses
+    # live also shows the possibly significant timers (a longer run will tell)
     timers = [c for c in timers if significance(c) >= (1 if live else 2)]
-    chart, size = loss_chart(losses, start, end, interval, sig, cols - 1, use_color,
-                             5, legend=not live)
-    what = (f"average loss of the targets after your router / ONT (the ISP side), "
-            f"{size // 60} min per column")
-    hours = hourly_rows(losses, start, end, interval, timers)
-    if live:
-        return [headline(f"Loss over time · {what}", cols, use_color)] + _live_hours(
-            chart, hours, timers, cols, use_color)
-    out = [color(f"  {what}", HELP, use_color)] + chart + [""]
-    labels = [("loss", "1"), ("random", "")] + [
-        (f"every {c['period']} s", SIGNIFICANCE[significance(c)][1] if significance(c) < 2 else "")
-        for c in timers]
-    out.append(color("  hour " + "".join(f"{l:>{max(8, len(l) + 2)}}" for l, _ in labels),
-                     GREY, use_color))
-    for h in hours:
-        vals = [h[1], h[2]] + h[3]
-        out.append(f"  {time.strftime('%H:%M', time.localtime(h[0]))}" + "".join(
-            f"{v:>{max(8, len(l) + 2) - 1}.2f}%" for v, (l, _) in zip(vals, labels)))
+    pct = lambda n, rounds: 100 * n / rounds
+    out = []
+    if isp["icmp"] or not (isp["tcp_lost"] or isp["tcp_resent"]):
+        b = loss_by_time(isp["icmp"], start, end, interval, sig, size)
+        h = loss_by_time(isp["icmp"], start, end, interval, timers, 3600)
+        rows = [("loss", "", "1", [pct(x[2], x[1]) for x in h]),
+                ("random", "1;31", "", [pct(x[2] - sum(x[3]), x[1]) for x in h])]
+        for k, c in enumerate(timers):
+            ok = significance(c) == 2
+            rows.append((f"every {c['period']} s" + ("" if ok or not live else " (maybe)"),
+                         TIMER_COLOR if ok else "", "" if ok else WARN, [pct(x[3][k], x[1]) for x in h]))
+        names = ", ".join(f"every {c['period']} s" for c in sig)
+        legend = (color("█", "1;31", use_color) + " random loss   " + (
+            color("█", TIMER_COLOR, use_color) + f" at a regular timer ({names})" if sig else
+            color("no statistically significant timer found", GREY, use_color)))
+        out.append(("ICMP (ping)", [(x[0], pct(x[2], x[1]), pct(sum(x[3]), x[1])) for x in b],
+                    (TIMER_COLOR, "1;31", RED_BG), legend, rows, [x[0] for x in h]))
+    if isp["tcp_lost"] or isp["tcp_resent"]:
+        lb = loss_by_time(isp["tcp_lost"], start, end, interval, [], size)
+        rb = loss_by_time(isp["tcp_resent"], start, end, interval, [], size)
+        lh = loss_by_time(isp["tcp_lost"], start, end, interval, [], 3600)
+        rh = loss_by_time(isp["tcp_resent"], start, end, interval, [], 3600)
+        rows = [("loss", "", "1", [pct(l[2] + r[2], l[1]) for l, r in zip(lh, rh)]),
+                ("resent", WARN, "", [pct(r[2], r[1]) for r in rh]),
+                ("lost", "1;31", "", [pct(l[2], l[1]) for l in lh])]
+        legend = (color("█", WARN, use_color) + " resent (answered after a resend)   "
+                  + color("█", "1;31", use_color) + " lost (no answer even after a resend)")
+        out.append(("TCP (handshakes)", [(l[0], pct(l[2] + r[2], l[1]), pct(l[2], l[1]))
+                                         for l, r in zip(lb, rb)],
+                    ("1;31", WARN, TCP_RESENT_BG), legend, rows, [x[0] for x in lh]))
     return out
 
 
-def _live_hours(chart, hours, timers, cols, use_color):
-    """Chart and loss per hour (hours as columns) side by side, or stacked if both don't fit.
-    The row labels double as the chart's legend: red = random, blue = timer."""
-    labels = [("loss", "", "1"), ("random", "1;31", ""), *(
-        (f"every {c['period']} s" + ("" if significance(c) == 2 else " (maybe)"),
-         TIMER_COLOR if significance(c) == 2 else "", "" if significance(c) == 2 else WARN)
-        for c in timers)]
-    lw = max(len(l) for l, _, _ in labels) + 4
+def loss_over_time(isp, start, end, interval, timers, cols, use_color, live):
+    """The loss-over-time section: per protocol a chart and the loss per hour (live: next
+    to each other, hours as columns; report: below each other, hours as rows)."""
+    what = "average loss of the targets after your router / ONT (the ISP side)"
+    if live:
+        # both protocols side by side if they fit, else below each other
+        for width in ((cols - 1) // 2 - 2, cols - 1):
+            size = bucket_size(start, end, width)
+            blocks = [_live_block(b, start, width, use_color)
+                      for b in loss_blocks(isp, start, end, interval, timers, size, use_color, True)]
+            if width == cols - 1 or all(max(map(vis_len, b)) <= width for b in blocks):
+                break
+        out = [headline(f"Loss over time · {what}, {size // 60} min per column", cols, use_color)]
+        if width < cols - 1 and len(blocks) == 2:
+            w = width + 4
+            return out + [a + " " * (w - vis_len(a)) + b for a, b in itertools.zip_longest(
+                *blocks, fillvalue="")]
+        for i, b in enumerate(blocks):
+            out += ([""] if i else []) + b
+        return out
+    size = bucket_size(start, end, cols)
+    out = [color(f"  {what}, {size // 60} min per column", HELP, use_color)]
+    for title, chart, colors, legend, rows, hours in loss_blocks(
+            isp, start, end, interval, timers, size, use_color, False):
+        out += ["", "  " + title] + bar_chart(chart, start, use_color, 5, True, *colors)
+        out += ["        " + legend, ""]
+        out.append(color("  hour " + "".join(f"{r[0]:>{max(8, len(r[0]) + 2)}}" for r in rows),
+                         GREY, use_color))
+        for k, h in enumerate(hours):
+            out.append(f"  {time.strftime('%H:%M', time.localtime(max(h, start)))}" + "".join(
+                f"{r[3][k]:>{max(8, len(r[0]) + 2) - 1}.2f}%" for r in rows))
+    return out
+
+
+def _live_block(block, start, width, use_color):
+    """One protocol: title, chart and loss per hour (hours as columns) side by side, or
+    stacked if both don't fit `width`. The row labels double as the chart's legend."""
+    title, chart, colors, _, rows, hours = block
+    chart = bar_chart(chart, start, use_color, 5, False, *colors)
+    lw = max(len(r[0]) for r in rows) + 4
 
     def table(n):
-        hs = hours[-n:]
-        rows = [color(" " * lw + "".join(f"{time.strftime('%H:%M', time.localtime(h[0])):>7}"
-                                         for h in hs), GREY, use_color)]
-        for k, (label, block, code) in enumerate(labels):
-            vals = [h[1] if k == 0 else h[2] if k == 1 else h[3][k - 2] for h in hs]
+        out = [color(" " * lw + "".join(f"{time.strftime('%H:%M', time.localtime(max(h, start))):>7}"
+                                        for h in hours[-n:]), GREY, use_color)]
+        for label, block, code, vals in rows:
             head = (color("█ ", block, use_color) if block else "  ") + label
-            rows.append(color(head + " " * (lw - len(label) - 2), code, use_color and bool(code))
-                        + "".join(f"{v:6.2f}%" for v in vals))
-        return rows
+            out.append(color(head + " " * (lw - len(label) - 2), code, use_color and bool(code))
+                       + "".join(f"{v:6.2f}%" for v in vals[-n:]))
+        return out
 
     cw = max(map(vis_len, chart)) + 4
-    if cw + lw + 7 * len(hours) <= cols - 1:     # everything fits next to the chart
+    head = [color(title, "1", use_color)]
+    if cw + lw + 7 * len(hours) <= width:     # everything fits next to the chart
         right = table(len(hours))
-        return [(chart[i] if i < len(chart) else "") + " " * (cw - vis_len(chart[i] if i < len(chart) else ""))
-                + (right[i] if i < len(right) else "") for i in range(max(len(chart), len(right)))]
-    return chart + table(max(1, (cols - 1 - lw) // 7))
+        return head + [a + " " * (cw - vis_len(a)) + b for a, b in itertools.zip_longest(
+            chart, right, fillvalue="")]
+    return head + chart + table(max(1, (width - lw) // 7))
+
+
+def differs(a, n, b, m):
+    """Are a of n and b of m clearly different shares (two-proportion z-test, |z| > 3)?"""
+    if not n or not m:
+        return False
+    p = (a + b) / (n + m)
+    if p in (0, 1):
+        return False
+    return abs(a / n - b / m) / math.sqrt(p * (1 - p) * (1 / n + 1 / m)) > 3
+
+
+def comparisons(prober, tracker):
+    """Side questions, answered from the extra probes and logs: [(topic, text)]."""
+    done = tracker.done
+    if not done:
+        return []
+    by = {t.name: t for t in prober.targets}
+    lost = lambda t: tracker.lost[t.name] + tracker.resent[t.name]
+    pc = lambda t: f"{100 * lost(t) / done:.2f}%"
+    out = []
+
+    # direction: a server that resends its SYN-ACK faster than macOS resends the SYN tells
+    # which one got lost
+    for t in prober.targets:
+        if not t.port or t.extra:
+            continue
+        fast = sum(1 for ms in t.resend_ms.values() if ms < 900)
+        slow = len(t.resend_ms) - fast
+        if fast >= 3:
+            out.append(("Direction", f"{t.name}: ISP → you {100 * fast / done:.2f}%, you → ISP "
+                        f"{100 * slow / done:.2f}% (the server resends its lost reply after "
+                        f"~0.3 s, macOS a lost request after ~1 s)"))
+    if not any(o[0] == "Direction" for o in out) and any(t.port for t in prober.targets):
+        out.append(("Direction", "unknown: no server here resent faster than macOS yet"))
+
+    def pairs(topic, base, variants, same, diff):
+        if not base or not variants:
+            return
+        rows = [(name, t) for name, t in variants if t]
+        verdict = [name for name, t in rows if differs(lost(base), done, lost(t), done)]
+        text = f"{base.name}: " + " · ".join(f"{name} {pc(t)}" for name, t in rows)
+        out.append((topic, text + f"  → {diff + ': ' + ', '.join(verdict) if verdict else 'no clear difference so far: ' + same}"))
+
+    for t in prober.targets:
+        big = by.get(f"{t.name}·1400B")
+        if big:
+            pairs("Packet size", t, [("small", t), ("1400 B", big)],
+                  "points to a queue (overload), not to bit errors",
+                  "big packets differ (bit errors on a line hit big packets more)")
+        marks = [(m, by.get(f"{t.name}·{m}")) for m in ("EF", "AF41", "CS1")]
+        if any(v for _, v in marks):
+            pairs("Priority marking", t, [("none", t)] + marks,
+                  "all markings treated alike", "treated differently")
+    v6 = [(by.get(a), by.get(b)) for a, b in (
+        (next((t.name for t in prober.targets if RANK_HOP <= t.rank < RANK_DEST and not t.port
+               and not t.extra), None), "v6-isp"), ("1.1.1.1", "v6-cloudflare"), ("8.8.8.8", "v6-google"))]
+    for t4, t6 in v6:
+        if t4 and t6:
+            pairs("IPv4 vs IPv6", t4, [("IPv4", t4), ("IPv6", t6)],
+                  "not caused by the IPv4 NAT", "IPv4 and IPv6 differ")
+
+    # this Mac's own traffic: was the line idle when packets got lost?
+    tr = prober.traffic
+    if len(tr) > 2:
+        rates = [(b[0], (b[1] - a[1] + b[2] - a[2]) * 8 / 1000 / max(0.1, b[0] - a[0]))
+                 for a, b in zip(tr, tr[1:])]
+        # minus the probes' own traffic
+        own = prober.probe_kbps
+        rates = [(t, max(0.0, r - 2 * own)) for t, r in rates]
+        down = max(0.0, (tr[-1][1] - tr[0][1]) * 8 / 1000 / max(1, tr[-1][0] - tr[0][0]) - own)
+        up = max(0.0, (tr[-1][2] - tr[0][2]) * 8 / 1000 / max(1, tr[-1][0] - tr[0][0]) - own)
+        busy_s = idle_s = busy_l = idle_l = 0
+        lt, j = tracker.loss_t, 0
+        for (t0, _), (t1, rate) in zip([(tr[0][0], 0)] + rates, rates):
+            while j < len(lt) and lt[j] < t0:
+                j += 1
+            k = j
+            while k < len(lt) and lt[k] < t1:
+                k += 1
+            if rate > 1000:
+                busy_s, busy_l = busy_s + t1 - t0, busy_l + k - j
+            else:
+                idle_s, idle_l = idle_s + t1 - t0, idle_l + k - j
+            j = k
+        iv = prober.interval
+        part = lambda l, sec: f"{100 * l * iv / sec:.2f}%" if sec >= 60 else "- (under 1 min)"
+        out.append(("Your own traffic", f"average {down:.0f} kbit/s down, {up:.0f} kbit/s up "
+                    f"(without the probes' {own:.0f}) · "
+                    f"rounds with a loss while it was quiet {part(idle_l, idle_s)}, while busy "
+                    f"(> 1 Mbit/s, {busy_s / 60:.0f} min) {part(busy_l, busy_s)}"))
+
+    changes = [(t, w) for t in prober.targets for w, _ in t.ttl_changes]
+    if getattr(prober, "replay", False):
+        changes = None
+    routes = changes is not None and f"{len(changes)} TTL changes" + (
+        f" (last: {max(changes, key=lambda c: c[1])[0].name} at {clock(max(c[1] for c in changes))})"
+        if changes else "") + " (the reply's TTL counts the routers on the way: a change = a new route)"
+    if changes is not None:
+        out.append(("Routes", routes))
+    order = ["Direction", "Packet size", "Priority marking", "IPv4 vs IPv6"]
+    out.sort(key=lambda o: order.index(o[0]) if o[0] in order else len(order))
+    if prober.clock_checks:
+        offs = [f"{o * 1000:+.0f} ms (±{u * 1000:.0f})" for _, o, u in prober.clock_checks]
+        worst = max(abs(o) for _, o, _ in prober.clock_checks)
+        out.append(("Mac clock", f"off from time.apple.com by {' at the start, '.join(offs)}"
+                    + (" at the end" if len(offs) > 1 else "") + (
+                        ": timer moments and their drift are measured right" if worst < 0.05 else
+                        ": off by more than 50 ms, timer moments are shifted by that much")))
+    q = prober.quality
+    if q:
+        out.append(("Measurement", f"worst send delay {max(r[1] for r in q):.0f} ms, worst read "
+                    f"delay {max(r[2] for r in q):.0f} ms, {sum(r[3] for r in q)} replies read "
+                    "too late (the Mac kept up if these stay small)"))
+    return out
+
+
+TREND_S = 600      # seconds per trend bucket
+
+
+def trends(prober, tracker, link_samples=()):
+    """What changed over the run: [(group title, unit, [(label, {bucket: (value, num, den)})])].
+    Buckets are 10 local minutes; num/den (counts) let start and end be tested against each
+    other where the value is a share."""
+    by = {t.name: t for t in prober.targets}
+    hist = tracker.hist
+    keys = sorted(set().union(*(h.keys() for h in hist.values()))) if hist else []
+    if not keys:
+        return []
+    share = lambda num, den: {b: (100 * num(b) / den(b) if den(b) else 0.0, num(b), den(b)) for b in keys}
+    h = lambda t, b, i: hist[t.name].get(b, [0, 0, 0, 0, None])[i]
+    lost = lambda t: share(lambda b: h(t, b, 1) + h(t, b, 2), lambda b: h(t, b, 0))
+
+    def p50(t):
+        out = {}
+        for b in keys:
+            c = hist[t.name].get(b, [0, 0, 0, 0, Counter()])[4]
+            n, acc = sum(c.values()), 0
+            for half in sorted(c):
+                acc += c[half]
+                if acc >= n / 2:
+                    out[b] = (half / 2 + 0.25, None, None)
+                    break
+        return out
+
+    main = [t for t in prober.targets if not t.extra and not t.port and t.rank > RANK_ONT]
+    hop = next((t for t in main if t.rank < RANK_DEST), None)
+    dests = [t for t in main if t.rank == RANK_DEST]
+    name = lambda t: KNOWN_HOSTS.get(t.addr, t.name) if t.rank == RANK_DEST else f"ISP first hop ({t.name})"
+    groups = []
+    groups.append(("Loss per destination (each leaves the ISP through another exit)", "%",
+                   [(name(t), lost(t)) for t in ([hop] if hop else []) + dests]))
+    tcp = [t for t in prober.targets if t.port and not t.extra and t.rank == RANK_DEST]
+    if tcp:
+        tot = lambda i: (lambda b: sum(h(t, b, i) for t in tcp))
+        if getattr(prober, "resent_known", True):
+            groups.append(("TCP to the destinations", "%", [
+                ("resent (TCP recovered it)", share(tot(2), tot(0))),
+                ("lost (even after a resend)", share(tot(1), tot(0)))]))
+        else:       # a run from before resends were told apart
+            groups.append(("TCP to the destinations", "%", [
+                ("lost or resent", share(lambda b: tot(1)(b) + tot(2)(b), tot(0)))]))
+    groups.append(("Latency, median", "ms", [(name(t), p50(t)) for t in ([hop] if hop else []) + dests]))
+    quick = [t for t in tcp if sum(x[3] for x in hist[t.name].values()) >= 3]
+    if quick:
+        n = lambda b: sum(h(t, b, 0) for t in quick)
+        groups.append((f"Direction ({', '.join(KNOWN_HOSTS.get(t.addr, t.name) for t in quick)}: "
+                       "server resends quickly)", "%", [
+            ("ISP → you", share(lambda b: sum(h(t, b, 3) for t in quick), n)),
+            ("you → ISP", share(lambda b: sum(h(t, b, 2) - h(t, b, 3) for t in quick), n))]))
+    rows = []
+    for t in main:
+        if f"{t.name}·1400B" in by:
+            rows += [(f"{name(t)}, small", lost(t)), (f"{name(t)}, 1400 bytes", lost(by[f"{t.name}·1400B"]))]
+    if rows:
+        groups.append(("Packet size", "%", rows))
+    if hop and f"{hop.name}·EF" in by:
+        groups.append(("Priority marking (ISP first hop)", "%", [("unmarked", lost(hop))] + [
+            (f"{m}: {what}", lost(by[f"{hop.name}·{m}"])) for m, _, what in MARKINGS
+            if f"{hop.name}·{m}" in by]))
+    rows = []
+    for t4, t6 in ((hop, by.get("v6-isp")), (by.get("1.1.1.1"), by.get("v6-cloudflare")),
+                   (by.get("8.8.8.8"), by.get("v6-google"))):
+        if t4 and t6:
+            rows += [(f"{name(t4)}, IPv4", lost(t4)), (f"{name(t4)}, IPv6", lost(t6))]
+    if rows:
+        groups.append(("IPv4 vs IPv6", "%", rows))
+
+    def per_bucket(samples, value):
+        """{bucket: value of the samples in it}, from (time, ...) samples."""
+        out = {}
+        for x in samples:
+            out.setdefault(int((x[0] + tracker.tz) // TREND_S), []).append(x)
+        return {b: (value(v), None, None) for b, v in out.items() if v}
+
+    tr = prober.traffic
+    if len(tr) > 2:
+        own = prober.probe_kbps
+        rate = lambda i: per_bucket(
+            [(b[0], b[i] - a[i], b[0] - a[0]) for a, b in zip(tr, tr[1:])],
+            lambda v: max(0.0, sum(x[1] for x in v) * 8 / 1000 / max(1, sum(x[2] for x in v)) - own))
+        groups.append(("Your own traffic (without the probes')", "kbit/s",
+                       [("down", rate(1)), ("up", rate(2))]))
+    if link_samples:
+        groups.append(("Wi-Fi", "dBm", [("signal", per_bucket(
+            [(x["t"], x["rssi"]) for x in link_samples], lambda v: statistics.median(x[1] for x in v)))]))
+    changes = [(w,) for t in prober.targets for w, _ in t.ttl_changes]
+    if not getattr(prober, "replay", False):
+        groups.append(("Routes", "", [("TTL changes", {**{b: (0, None, None) for b in keys},
+                                                       **per_bucket(changes, len)})]))
+    if prober.quality:
+        groups.append(("Measurement", "ms", [("worst read delay", per_bucket(
+            [(m + 30, b) for m, _, b, _ in prober.quality if m], lambda v: max(x[1] for x in v)))]))
+    loss = ("Loss per destination", "TCP to the destinations", "Latency", "Direction")
+    return [(title, unit, [(label, vals) for label, vals in rows if vals],
+             "loss" if title.startswith(loss) else "tests") for title, unit, rows in groups]
+
+
+SERIES_COLORS = ("36", "35", "34", "32", "33", "37")   # the series of a trend chart
+SERIES_GLYPHS = ("█", "▓", "▒", "░", "#", "+")          # the same without colors (report)
+
+
+def trend_lines(prober, tracker, cols, use_color, link_samples=(), part=None):
+    """The Trends views / report section: per group one chart over the run in the style of
+    the loss-over-time chart, its series as grouped bars (one column each per time slot,
+    same scale), and below it per series the first and the last hour, the lowest and the
+    highest hour, and whether start and end differ. Two groups side by side if they fit.
+    `part`: only the "loss" or the "tests" groups."""
+    groups = [g[:3] for g in trends(prober, tracker, link_samples) if part in (None, g[3])]
+    if not groups:
+        return []
+    keys = sorted({b for _, _, rows in groups for _, vals in rows for b in vals})
+    hours = {}
+    for b in keys:
+        hours.setdefault(b * TREND_S // 3600, []).append(b)
+    span = min(len(keys), 6)       # start / end: the first and the last hour (or less)
+    first, last = keys[:span], keys[-span:]
+
+    def agg(vals, bs):
+        """Value of a set of buckets: counts summed if there are any, else the mean."""
+        got = [vals[b] for b in bs if b in vals]
+        if not got:
+            return None, 0, 0
+        if got[0][2] is not None:
+            num, den = sum(g[1] for g in got), sum(g[2] for g in got)
+            return (100 * num / den if den else 0.0), num, den
+        return statistics.mean(g[0] for g in got), None, None
+
+    # two charts side by side if each still gets a useful width
+    bw = (cols - 4) // 2 if (cols - 4) // 2 >= 90 else cols - 1
+    blocks = []
+    for title, unit, rows in groups:
+        n = len(rows)
+        fmt = lambda v: ("-" if v is None else f"{v:.2f}" if unit == "%" else
+                         f"{v:.1f}" if unit == "ms" else f"{v:.0f}")
+        # time slots: 10 min, or merged until every slot's bars fit (n bars + a gap each)
+        k = next((k for k in (1, 2, 3, 6, 12, 18, 24, 36, 72) if (len(keys) // k + 2) * (n + 1)
+                  <= bw - 9), 144)
+        # slots on the clock (10 / 20 / 30 min, whole hours), so hours start a slot
+        slots = [list(g) for _, g in itertools.groupby(keys, key=lambda b: b // k)]
+        vals = [[agg(v, sl)[0] for sl in slots] for _, v in rows]
+        flat = [v for row in vals for v in row if v is not None] or [0]
+        lo, hi = (min(flat), max(flat)) if unit == "dBm" else (0, max(flat) or 1e-9)
+        height = 5 if n > 1 else 3      # a single series needs less room
+        chart = []
+        for r in range(height - 1, -1, -1):
+            line = ""
+            for si in range(len(slots)):
+                for ri in range(n):
+                    v = vals[ri][si]
+                    lvl = 0 if v is None else max(1 if v > lo or unit == "dBm" else 0,
+                                                  round((v - lo) / ((hi - lo) or 1) * height * 8))
+                    fill = min(8, max(0, lvl - 8 * r))
+                    if not fill:
+                        line += " "
+                    elif use_color:
+                        line += color(SPARK[fill], SERIES_COLORS[ri % 6], True)
+                    else:      # no colors: a shade per series, cells at least half full
+                        line += SERIES_GLYPHS[ri % 6] if fill >= 4 else " "
+                line += " "
+            top = f"{fmt(hi)}{unit if unit == '%' else ''}"
+            label = f"{top:>6} ┤" if r == height - 1 else (f"{fmt(lo):>6} ┤" if r == 0 and unit == "dBm"
+                                                            else "       │")
+            chart.append(color(label, GREY, use_color) + line)
+        marks, free = [" "] * (len(slots) * (n + 1) + 8), 0
+        for si, sl in enumerate(slots):
+            hour = next((b for b in sl if b * TREND_S % 3600 == 0), None)
+            if si * (n + 1) >= free and (si == 0 or hour is not None):
+                lt = time.gmtime((hour if hour is not None else sl[0]) * TREND_S)  # local, see tz
+                marks[8 + si * (n + 1):8 + si * (n + 1) + 5] = time.strftime("%H:%M", lt)
+                free = si * (n + 1) + 6
+        chart.append(color("".join(marks).rstrip(), GREY, use_color))
+        # the series: legend and numbers
+        lw = min(max(len(label) for label, _ in rows) + 2, max(12, bw - 66))
+        table = [color(f"  {'':<{lw}}{'start':>8}{'end':>8}{'lowest':>13}{'highest':>13}  change "
+                       "start → end", GREY, use_color)]
+        for ri, (label, v) in enumerate(rows):
+            s_, sn, sd = agg(v, first)
+            e_, en, ed = agg(v, last)
+            per_hour = [(x, hr) for hr in sorted(hours) for x in [agg(v, hours[hr])[0]] if x is not None]
+            low = min(per_hour, default=None)
+            high = max(per_hour, default=None)
+            at = lambda x: f"{fmt(x[0])} {time.strftime('%H:00', time.gmtime(x[1] * 3600))}" if x else "-"
+            if len(keys) < 2 * span or s_ is None or e_ is None:
+                change = "-"
+            elif sd is not None:
+                change = (("↑ " if e_ > s_ else "↓ ") + (f"{e_ / s_:.1f}×" if s_ else "from 0")
+                          if differs(sn, sd, en, ed) else "no clear change")
+            else:
+                change = (("↑ " if e_ > s_ else "↓ ") + f"{e_ / s_:.1f}×" if s_ and abs(e_ / s_ - 1) > 0.2
+                          else "about the same")
+            key = (color("█", SERIES_COLORS[ri % 6], True) if use_color else SERIES_GLYPHS[ri % 6])
+            table.append(f"{key} {label[:lw]:<{lw}}{fmt(s_):>8}{fmt(e_):>8}{at(low):>13}{at(high):>13}  "
+                         + color(change, "1" if change.startswith(("↑", "↓")) else GREY, use_color))
+        head = color(title, "1", use_color) + (color(f" · {unit}", GREY, use_color) if unit else "")
+        blocks.append([head] + chart + table)
+
+    out = []
+    if bw < cols - 1:          # two per row
+        for a, b in itertools.zip_longest(blocks[0::2], blocks[1::2], fillvalue=[]):
+            out += [""] + [x + " " * (bw + 3 - vis_len(x)) + y
+                           for x, y in itertools.zip_longest(a, b, fillvalue="")]
+    else:
+        for b in blocks:
+            out += [""] + b
+    return out[1:]
 
 
 def clock(t, decimals=1):
@@ -1445,11 +2005,14 @@ def headline(title, cols, use_color):
     return color(f"── {title} " + "─" * max(0, cols - len(title) - 5), "1", use_color)
 
 
-def event_line(e, interval, use_color):
+def event_line(e, interval, use_color, timers=()):
+    """One event; a loss at the moment of a (statistically significant) timer says so."""
     ts = clock(e["t"])
     dur = fmt_dur(e["rounds"] * interval)
     if e["kind"] == "loss":
-        return f"{ts}  {color('LOSS ', '1;31', use_color)}  {dur:>7}  {e['desc']}"
+        timer = next((c for c in timers if at_timer(c, e["t"])), None)
+        tag = color(f"  ({timer['period']} s timer)", TIMER_COLOR, use_color) if timer else ""
+        return f"{ts}  {color('LOSS ', '1;31', use_color)}  {dur:>7}  {e['desc']}{tag}"
     return (f"{ts}  {color('SPIKE', WARN, use_color)}  {dur:>7}  {e['desc']} "
             f"(up to {e['peak']:.0f} ms)")
 
@@ -1476,7 +2039,9 @@ def events_view(tracker, interval, cols, space, use_color):
         line += "─" * max(1, cols - 1 - len(line) - len(hint) - 2)
         head = color(line, "1", use_color) + color(hint, GREY, use_color) + color("──", "1", use_color)
     out = [head, color("time        type    lasted  targets", GREY, use_color)]
-    out += [event_line(e, interval, use_color) for e in shown]
+    views = getattr(tracker, "_views", None)
+    timers = [c for c in views[0][5] if significance(c) == 2] if views else []
+    out += [event_line(e, interval, use_color, timers) for e in shown]
     return out
 
 
@@ -1485,7 +2050,8 @@ def read_keys(tracker, stop):
     fd = sys.stdin.fileno()
     keys = {b"\x1b[A": 1, b"k": 1, b"\x1b[B": -1, b"j": -1, b"\x1b[5~": "pg", b"\x1b[6~": "-pg",
             b"\x1b[H": "home", b"\x1b[1~": "home", b"g": "home",
-            b"\x1b[F": "end", b"\x1b[4~": "end", b"G": "end", b"h": "help", b"?": "help"}
+            b"\x1b[F": "end", b"\x1b[4~": "end", b"G": "end", b"h": "help", b"?": "help",
+            b"1": "v0", b"2": "v1", b"3": "v2", b"4": "v3", b"5": "v4", b"6": "v5", b"\t": "tab", b"\x1b[C": "tab", b"\x1b[D": "back"}
     while not stop.is_set():
         if not select.select([fd], [], [], 0.2)[0]:
             continue
@@ -1496,6 +2062,12 @@ def read_keys(tracker, stop):
             k = -tracker.page
         if k == "help":
             tracker.show_help = not tracker.show_help
+        elif k in ("v0", "v1", "v2", "v3", "v4", "v5"):
+            tracker.view = int(k[1])
+        elif k == "tab":
+            tracker.view = (tracker.view + 1) % len(VIEWS)
+        elif k == "back":
+            tracker.view = (tracker.view - 1) % len(VIEWS)
         elif k == "home":
             tracker.scroll = len(tracker.events)
         elif k == "end":
@@ -1504,106 +2076,328 @@ def read_keys(tracker, stop):
             tracker.scroll = max(0, tracker.scroll + k)
 
 
-def render(prober, tracker, link_desc, wifi_now, started, use_color, drawn):
-    """Draw the dashboard over the previous frame (`drawn` lines). Returns lines drawn."""
+# what each view answers: now · when · what kind of loss · can the measurement be trusted
+VIEWS = ("Live", "Timeline", "Tests", "Trends", "Test trends", "Raw")
+
+GROUPS = (
+    ("Direction", "a lost TCP reply is resent by the server, a lost request by macOS (after "
+     "~1 s). Servers that resend sooner (Google: ~0.3 s) show which way packets get lost"),
+    ("Packet size", "bit errors on a line hit big packets more often than small ones; an "
+     "overloaded queue drops both alike"),
+    ("Priority marking", "packets can ask for priority with a marking; the ISP's first hop copies "
+     "it into its reply, so it counts both ways. Different loss = the ISP's traffic management "
+     "treats them differently"),
+    ("IPv4 vs IPv6", "IPv6 takes another path through the ISP (no carrier-grade NAT)"),
+    ("Your own traffic", "was this Mac busy when packets got lost? (the probes' own traffic "
+     "doesn't count)"),
+)
+
+
+def cached_comparisons(prober, tracker):
+    """comparisons(), redone at most every 10 s."""
+    c = getattr(tracker, "_comp", None)
+    if not c or time.time() - c[0] >= 10:
+        c = tracker._comp = (time.time(), comparisons(prober, tracker))
+    return c[1]
+
+
+def detail_groups(prober, tracker, cols, use_color):
+    """The extra probes for the Details view, grouped by question, each next to the normal
+    probe it's compared with, with an explanation and the current verdict."""
+    by = {t.name: t for t in prober.targets}
+    main = [t for t in prober.targets if not t.extra and not t.port]
+    verdicts = cached_comparisons(prober, tracker)
+    groups = {title: [] for title, _ in GROUPS}
+    for t in prober.targets:
+        if t.port and not t.extra:
+            # the same snapshot as the verdict above it
+            fast = any(topic == "Direction" and text.startswith(t.name + ":") for topic, text in verdicts)
+            groups["Direction"].append((t, f"{KNOWN_HOSTS.get(t.addr, t.addr)}: " + (
+                "resends quickly, direction known" if fast else "resends after ~1 s, like macOS")))
+    for t in main:
+        if f"{t.name}·1400B" in by:
+            groups["Packet size"] += [(t, "small: 53 bytes"), by[f"{t.name}·1400B"]]
+        marks = [by[f"{t.name}·{m}"] for m, _, _ in MARKINGS if f"{t.name}·{m}" in by]
+        if marks:
+            groups["Priority marking"] += [(t, "unmarked")] + marks
+    hop = next((t for t in main if RANK_HOP <= t.rank < RANK_DEST), None)
+    v6 = {hop.name: "v6-isp"} if hop else {}
+    v6.update({"1.1.1.1": "v6-cloudflare", "8.8.8.8": "v6-google"})
+    for name, other in v6.items():
+        if name in by and other in by:
+            groups["IPv4 vs IPv6"] += [(by[name], f"IPv4: {by[name].label or KNOWN_HOSTS.get(by[name].addr, name)}"),
+                                       by[other]]
+    out = []
+    for title, why in GROUPS:
+        if not groups[title] and not any(topic == title for topic, _ in verdicts):
+            continue
+        head = wrap(f"{title} · {why}", cols - 2, "  ").split("\n")
+        out += ["", color(title, "1", use_color) + color(head[0][len(title):], HELP, use_color)]
+        out += [color(l, HELP, use_color) for l in head[1:]]
+        for topic, text in verdicts:
+            if topic == title:
+                out += [color(l, "1", use_color) for l in
+                        ("  → " + wrap(text, cols - 6, "    ")).split("\n")]
+        out += groups[title]
+    return out
+
+
+def probe_table(prober, tracker, entries, title, cols, use_color, compact=False):
+    """Per target: loss, latency and the per-second timeline (two rows each). An entry is a
+    Target, (Target, label for its second row), or a line of text (a group heading).
+    Compact: one row each, with the label in front and only the losses in the timeline."""
+    done = tracker.done
+    rows = [e if isinstance(e, (tuple, str)) else (e, None) for e in entries]
+    targets = [e[0] for e in rows if not isinstance(e, str)]
+    label = lambda t: f"{t.addr}:{t.port}" if t.port else t.addr
+    name_of = lambda t, l2: l2 or t.label or (KNOWN_HOSTS.get(t.addr, t.name) if t.rank == RANK_DEST
+                                             else t.name)
+    aw = max(len(label(t)) for t in targets) + 2
+    nw = max(len(name_of(*e)) for e in rows if not isinstance(e, str)) + 2 if compact else 0
+    left_w = nw + aw + 37                # (name,) address, loss / resent / last / p50 / p95
+    spark_w = max(10, cols - left_w - 4)
+    per_col = max(1, round(1 / prober.interval))     # one column = one second
+    spark_end = done // per_col * per_col   # only complete seconds: shifts once per second
+    if compact:
+        lines = [headline(title, cols, use_color),
+                 f"{'':<{nw}}{'address':<{aw}}{'loss':>8}{'resent':>8}{'last':>7}{'p50':>7}"
+                 f"{'p95':>7}   last {spark_w}s · " + color("digit", "1;31", use_color)
+                 + " = lost/s, " + color("yellow", WARN, use_color) + " = all resent by TCP"]
+    else:
+        lines = [headline(title, cols, use_color),
+             f"{'address':<{aw}}{'loss':>8}{'resent':>8}{'last':>7}{'p50':>7}"
+             f"{'p95':>7}   last {spark_w}s · bar = ping above p50 (+5/10 ms, "
+             + color(f"█ spike +{SPIKE_MS}", WARN, use_color) + ") · "
+             + color("digit", "1;31", use_color) + " = lost/s, " + color("yellow", WARN, use_color)
+             + " = all resent by TCP"]
+    pcts = tracker._pcts[1]
+    for entry in rows:
+        if isinstance(entry, str):
+            lines.append(entry)
+            continue
+        t, label2 = entry
+        lost = tracker.lost[t.name]
+        last = next((t.rtt[i] for i in range(done - 1, max(-1, done - 200), -1)
+                     if isinstance(t.rtt[i], float)), None)
+        p50, p95 = pcts.get(t.name, (None, None))
+        f = lambda v: f"{v:7.1f}" if v is not None else "      -"
+        loss = 100 * lost / done if done else 0
+        ls = f"{loss:7.2f}%"
+        # TCP: answered only after a resend (a packet was lost, TCP recovered it)
+        rs = f"{100 * tracker.resent[t.name] / done if done else 0:7.2f}%" if t.port else " " * 8
+        rest = f"{f(last)}{f(p50)}{f(p95)}"
+        # compact: what the probe tests first (it matters), how it's measured (address) in grey
+        left = (f"{name_of(t, label2):<{nw}}" + color(f"{label(t):<{aw}}", GREY, use_color) if compact
+                else f"{label(t):<{aw}}")
+        if time.time() - t.lost_at < 0.15:
+            # flash the row the moment a probe is declared lost (redrawn 10×/s)
+            left = color(left + ls + rs + rest, "1;97;41", use_color)
+        else:
+            left += (color(ls, "1;31", use_color) if loss >= 0.5 else ls) + rs + rest
+        ping, lossc = spark_cells(t, spark_end, spark_w, per_col, p50)
+        paint = lambda cells: "".join(color(ch, c, use_color) if c else ch for ch, c in cells)
+        if compact:      # one row: the losses, a faint dot for seconds without
+            lines.append(f"{left}   " + "".join(
+                color(ch, c, use_color) if c else color("·" if p[0] != " " else " ", GREY, use_color)
+                for (ch, c), p in zip(lossc, ping)))
+            continue
+        lines.append(f"{left}   {paint(ping)}")
+        # loss row right under its ping row; stays empty while nothing is lost
+        name = name_of(t, label2)
+        name = f"{name[:left_w - 8]:<{left_w - 6}}"     # up to the "lost/s" label
+        lines.append(color(name, GREY, use_color)
+                     + color("lost/s", GREY, use_color) + "   " + paint(lossc))
+    return lines
+
+
+def render(prober, tracker, link_desc, wifi_now, started, use_color):
+    """Draw the dashboard, full screen (on the alternate screen, from its top left)."""
     cols, term_rows = shutil.get_terminal_size((100, 30))
     done = tracker.done
     targets = prober.targets
     el = time.time() - started
     lines = []
     top = (color("netdiag", "1", use_color) +
-           f"  {link_desc}  ·  {int(el // 60)}m{int(el % 60):02d}s  ·  "
-           f"{done} rounds @ {prober.interval * 1000:.0f} ms  ·  Ctrl+C = stop + report")
+           f"  {link_desc}  ·  {f'{int(el // 60)}m{int(el % 60):02d}s':>7}  ·  "
+           f"{done:>7} rounds @ {prober.interval * 1000:.0f} ms  ·  Ctrl+C stops")
+    wifi = ""
     if wifi_now:       # Wi-Fi link state, right-aligned on the same line
         w = wifi_now[-1]
         wifi = (f"Wi-Fi ch {w['channel']} · {w['rssi']} dBm · SNR {w['rssi'] - w['noise']} dB · "
                 f"{w['rate']:.0f} Mbps")
-        top += " " * max(2, cols - 1 - vis_len(top) - len(wifi)) + wifi
-    lines.append(top)
-    lines.append(headline("Probes", cols, use_color))
-    label = lambda t: f"{t.addr}:{t.port}" if t.port else t.addr
-    aw = max(len(label(t)) for t in targets) + 2
-    left_w = 4 + aw + 29                 # hop, address, loss / last / p50 / p95
-    spark_w = max(10, cols - left_w - 4)
-    per_col = max(1, round(1 / prober.interval))     # one column = one second
-    spark_end = done // per_col * per_col   # only complete seconds: shifts once per second
-    lines.append(f"{'hop':>3} {'address':<{aw}}{'loss':>8}{'last':>7}{'p50':>7}"
-                 f"{'p95':>7}   last {spark_w}s · bar = ping above p50 (+5/10 ms, " + color(f"█ spike +{SPIKE_MS}", WARN, use_color) + ") · "
-                 + color("digit", "1;31", use_color) + " = lost/s")
+    # the views as tabs, centered in the top line if there's room, else on a line of their own
+    tabs = (" ".join(color(f" {i + 1} {name} ", "1;7" if tracker.view == i else HELP, use_color)
+                     for i, name in enumerate(VIEWS))
+            + color(f"  ← → or 1–{len(VIEWS)}", GREY, use_color))
+    pos = max((cols - vis_len(tabs)) // 2, vis_len(top) + 3)   # centered, or right of the text
+    if pos + vis_len(tabs) + 2 + len(wifi) <= cols - 1:
+        top += " " * (pos - vis_len(top)) + tabs
+        lines.append(top + " " * max(2, cols - 1 - vis_len(top) - len(wifi)) + wifi)
+    else:
+        lines.append(top + " " * max(2, cols - 1 - vis_len(top) - len(wifi)) + wifi)
+        lines.append(tabs)
     # percentiles of the recent replies, refreshed every 5 s: sorting them on every frame
     # would eat the CPU time the probe threads need on long runs
+    per_col = max(1, round(1 / prober.interval))
     cache = getattr(tracker, "_pcts", None)
     if not cache or done - cache[0] >= 5 * per_col or done < cache[0]:
-        cache = tracker._pcts = (done, {})
+        tracker._pcts = (done, {})
         for t in targets:
             nums = sorted(v for v in t.rtt[max(0, done - 20000):done] if isinstance(v, float))
-            cache[1][t.name] = (pct(nums, 50), pct(nums, 95)) if nums else (None, None)
-    for t in targets:
-        lost = tracker.lost[t.name]
-        last = next((t.rtt[i] for i in range(done - 1, max(-1, done - 200), -1)
-                     if isinstance(t.rtt[i], float)), None)
-        p50, p95 = cache[1][t.name]
-        f = lambda v: f"{v:7.1f}" if v is not None else "      -"
-        loss = 100 * lost / done if done else 0
-        ls = f"{loss:7.2f}%"
-        rest = f"{f(last)}{f(p50)}{f(p95)}"
-        left = f"{t.hop or '-':>3} {label(t):<{aw}}"
-        if time.time() - t.lost_at < 0.15:
-            # flash the row the moment a probe is declared lost (redrawn 10×/s)
-            left = color(left + ls + rest, "1;97;41", use_color)
-        else:
-            left += (color(ls, "1;31", use_color) if loss >= 0.5 else ls) + rest
-        ping, lossc = spark_cells(t, spark_end, spark_w, per_col, p50)
-        paint = lambda cells: "".join(color(ch, c, use_color) if c else ch for ch, c in cells)
-        lines.append(f"{left}   {paint(ping)}")
-        # loss row right under its ping row; stays empty while nothing is lost
-        name = f"{t.name[:aw - 1]:<{aw}}"
-        lines.append("    " + color(name, GREY, use_color) + " " * (left_w - 10 - aw)
-                     + color("lost/s", GREY, use_color) + "   " + paint(lossc))
-    lines.append("")
-    views = getattr(tracker, "_views", None)
-    cache = getattr(tracker, "_over_time", None)
-    if done and (not cache or time.time() - cache[0] >= 10 or cache[1] is not views
-                 or cache[2] != cols):
-        timers = views[0][5] if views else []
-        cache = tracker._over_time = (time.time(), views, cols, loss_over_time(
-            tracker.isp_loss, prober.send_t[0], prober.send_t[done - 1], prober.interval, timers,
-            cols, use_color, True))
-    if cache:
-        lines += cache[3] + [""]
+            tracker._pcts[1][t.name] = (pct(nums, 50), pct(nums, 95)) if nums else (None, None)
+    # the interval scan keeps running in the background whatever view is shown
     blocks = interval_blocks(prober, tracker, use_color)
-    if getattr(tracker, "_intervals_busy", None):
-        status = "recalculating…"
+
+    if tracker.view == 0:
+        lines += probe_table(prober, tracker, [t for t in targets if not t.extra], "Probes", cols,
+                             use_color)
+        # newest events at the bottom, as many as fit
+        lines.append("")
+        lines += events_view(tracker, prober.interval, cols, term_rows - 1 - len(lines), use_color)
+    elif tracker.view == 1:
+        views = getattr(tracker, "_views", None)
+        cache = getattr(tracker, "_over_time", None)
+        if done and (not cache or time.time() - cache[0] >= 10 or cache[1] is not views
+                     or cache[2] != cols):
+            timers = views[0][5] if views else []
+            cache = tracker._over_time = (time.time(), views, cols, loss_over_time(
+                tracker.isp_loss, prober.send_t[0], prober.send_t[done - 1], prober.interval,
+                timers, cols, use_color, True))
+        if cache:
+            lines += cache[3] + [""]
+        if getattr(tracker, "_intervals_busy", None):
+            status = "recalculating…"
+        else:
+            age = time.time() - tracker._intervals[0]
+            status = (f"updated {age:.0f} s ago, next in "
+                      f"{max(0, tracker._intervals_every - age):.0f} s")
+        lines.append(headline(f"Regular loss intervals · {status} · h = "
+                              + ("hide help" if tracker.show_help else "help"), cols, use_color))
+        if tracker.show_help:
+            lines += [color(l, HELP, use_color) for l in wrap(INTERVAL_HELP, cols - 2, "").split("\n")]
+        w = max(map(vis_len, blocks[0])) + 6
+        if len(blocks) == 2 and cols - 1 >= w + max(map(vis_len, blocks[1])):  # side by side
+            for a, b in itertools.zip_longest(*blocks, fillvalue=""):
+                lines.append(a + " " * (w - vis_len(a)) + b)
+        else:
+            for i, b in enumerate(blocks):
+                lines += ([""] if i else []) + b
+    elif tracker.view == 2:
+        lines += probe_table(prober, tracker, detail_groups(prober, tracker, cols, use_color),
+                             "Tests: what kind of loss is it? Each extra probe is next to the "
+                             "normal one it's compared with" + ("" if any(t.extra for t in targets)
+                                                                else " (none: --no-extra)"),
+                             cols, use_color, compact=True)
+    elif tracker.view in (3, 4):
+        part = "loss" if tracker.view == 3 else "tests"
+        cache = getattr(tracker, "_trends", None)
+        if not cache or time.time() - cache[0] >= 10 or cache[1:3] != (cols, part):
+            cache = tracker._trends = (time.time(), cols, part, trend_lines(
+                prober, tracker, cols, use_color, wifi_now, part))
+        lines.append(headline("Trends: what changed over the run, and what didn't" if part == "loss"
+                              else "Test trends: how the tests changed over the run", cols, use_color))
+        lines += cache[3] or ["  (after the first probe rounds)"]
     else:
-        age = time.time() - tracker._intervals[0]
-        status = (f"updated {age:.0f} s ago, next in "
-                  f"{max(0, tracker._intervals_every - age):.0f} s")
-    lines.append(headline(f"Regular loss intervals · {status} · h = "
-                          + ("hide help" if tracker.show_help else "help"), cols, use_color))
-    if tracker.show_help:
-        lines += [color(l, HELP, use_color) for l in wrap(INTERVAL_HELP, cols - 2, "").split("\n")]
-    w = max(map(vis_len, blocks[0])) + 6
-    if len(blocks) == 2 and cols - 1 >= w + max(map(vis_len, blocks[1])):  # side by side
-        for i in range(max(map(len, blocks))):
-            a = blocks[0][i] if i < len(blocks[0]) else ""
-            b = blocks[1][i] if i < len(blocks[1]) else ""
-            lines.append(a + " " * (w - vis_len(a)) + b)
-    else:
-        for i, b in enumerate(blocks):
-            lines += ([""] if i else []) + b
-    # newest events at the bottom, as many as fit; the frame must fit on screen, or
-    # moving the cursor back up can't reach its top
-    lines.append("")
-    lines += events_view(tracker, prober.interval, cols, term_rows - 1 - len(lines), use_color)
-    lines = lines[:max(1, term_rows - 1)]
-    up = f"\x1b[{drawn}F" if drawn else ""   # back to the first line of the previous frame
-    out = up + "".join(fit(l, cols - 1) + "\x1b[K\n" for l in lines) + "\x1b[J"
-    sys.stdout.write(out)
+        verdicts = dict(cached_comparisons(prober, tracker))
+        lines.append(headline("Routes and markings of the replies", cols, use_color))
+        if "Routes" in verdicts:
+            lines.append(color("  → " + verdicts["Routes"], "1", use_color))
+        for t in targets:
+            if t.port:
+                continue
+            tos = ", ".join(f"0x{k:02x} {100 * v / max(1, sum(t.reply_tos.values())):.0f}%"
+                            for k, v in t.reply_tos.most_common(2))
+            change = (f"changed {len(t.ttl_changes)}×, last {clock(t.ttl_changes[-1][0])}"
+                      if t.ttl_changes else "unchanged")
+            lines.append(f"  {t.name:<22} TTL {t.ttl if t.ttl is not None else '-':>3} {change:<34}"
+                         f"reply marking {tos or '-'}")
+        lines += ["", headline("This Mac", cols, use_color)]
+        tr = prober.traffic
+        if len(tr) > 2:
+            a, b = tr[max(0, len(tr) - 11)], tr[-1]
+            sec = max(1, b[0] - a[0])
+            own = prober.probe_kbps
+            lines.append(f"  own traffic, last 10 s: {max(0, (b[1] - a[1]) * 8 / 1000 / sec - own):.0f} kbit/s "
+                         f"down, {max(0, (b[2] - a[2]) * 8 / 1000 / sec - own):.0f} kbit/s up (without "
+                         f"the probes' {own:.0f}) · interface input errors during the test: {b[3] - tr[0][3]}")
+        if "Measurement" in verdicts:
+            lines.append(color("  → whole run: " + verdicts["Measurement"], "1", use_color))
+        if "Mac clock" in verdicts:
+            lines.append(color("  → clock " + verdicts["Mac clock"], "1", use_color))
+        q = prober.quality[-5:]
+        if q:
+            lines.append(f"  measurement, last 5 min: worst send delay {max(r[1] for r in q):.0f} ms, "
+                         f"worst read delay {max(r[2] for r in q):.0f} ms, "
+                         f"{sum(r[3] for r in q)} replies read too late")
+        if prober.status_runs:
+            lines.append(f"  --status-cmd ran {prober.status_runs}× (status.txt)")
+        lines.append(f"  everything is logged to {tracker.out_dir}/ during the run")
+    # exactly the screen: one line less would leave the old frame's last line, one more scrolls
+    lines = lines[:term_rows]
+    sys.stdout.write("\x1b[H" + "\x1b[K\r\n".join(fit(l, cols - 1) for l in lines) + "\x1b[K\x1b[J")
     sys.stdout.flush()
-    return len(lines)
 
 
 # ---------------------------------------------------------------- run
+
+class Startup:
+    """The startup screen: each step with … while it runs and ✓ (or ⚠) with its result. On a
+    terminal it's drawn full screen, on the alternate screen the dashboard then takes over
+    (like top or less); the finished list is printed again afterwards, so it stays in the
+    scrollback. Without a terminal, finished steps are just printed."""
+
+    def __init__(self, tty):
+        self.tty, self.rows, self.full = tty, [], False
+        if tty:
+            self.full = True
+            sys.stdout.write("\x1b[?1049h\x1b[?25l")    # alternate screen, cursor hidden
+            atexit.register(self.leave)         # also on Ctrl+C or a crash during startup
+        self.draw()
+
+    def leave(self):
+        """Back to the normal screen, as it was before the run."""
+        if self.full:
+            self.full = False
+            sys.stdout.write("\x1b[?25h\x1b[?1049l")
+            sys.stdout.flush()
+
+    def step(self, text):
+        self.rows.append(["…", text, ""])
+        self.draw()
+
+    def done(self, result="", mark="✓"):
+        self.rows[-1][0], self.rows[-1][2] = mark, result
+        self.draw()
+        if not self.tty:
+            print(self.line(self.rows[-1], False))
+
+    def note(self, text, mark=""):
+        """An extra line under the current step (a skipped hop, a warning)."""
+        self.rows.append([mark, "  " + text, ""])
+        self.draw()
+        if not self.tty:
+            print(self.line(self.rows[-1], False))
+
+    def line(self, r, use_color):
+        mark, text, result = r
+        code = {"✓": "1;32", "⚠": WARN, "…": GREY}.get(mark)
+        return (f"  {color(mark, code, use_color and bool(code)) if mark else ' '} {text}"
+                + (color(f" · {result}", GREY if mark == "✓" else "", use_color and mark == "✓")
+                   if result else ""))
+
+    def text(self):
+        return [self.line(r, False) for r in self.rows]
+
+    def draw(self):
+        if not self.full:
+            return
+        cols, rows = shutil.get_terminal_size((100, 30))
+        out = ["", color("  netdiag", "1", True) + color("  getting ready…", GREY, True), ""]
+        out += [self.line(r, True) for r in self.rows]
+        out = out[-(rows - 1):]
+        sys.stdout.write("\x1b[H" + "\x1b[K\r\n".join(fit(l, cols - 1) for l in out) + "\x1b[K\x1b[J")
+        sys.stdout.flush()
+
 
 def cmd_run(args):
     gw, iface = default_route()
@@ -1611,17 +2405,20 @@ def cmd_run(args):
         sys.exit("No default route. Are you connected?")
     iface = physical_iface(iface)
     link = detect_link(iface, args.link)
+    tty = sys.stdout.isatty()
+    su = Startup(tty)
+    su.step("Detecting the connection")
     port = hardware_ports().get(iface, iface)
     link_label = "Wi-Fi" if link == "wifi" else "Ethernet/LAN"
-    print(f"Connection: {link_label} on {iface} ({port}), router {gw}")
+    su.done(f"{link_label} on {iface} ({port}), router {gw}")
 
     ont = args.ont
     # Direct mode: this machine is plugged straight into the ONT (no home router), so
     # the ONT is on-link and the default gateway is already the ISP's first router.
     direct = bool(ont) and on_link(ont)
     if ont and not direct and is_router_itself(ont):
-        print(f"  {ont} answers as hop 1, so it's an address of the router itself, not an ONT. "
-              "Ignoring --ont.")
+        su.note(f"{ont} answers as hop 1, so it's an address of the router itself, not an ONT: "
+                "ignoring --ont", "⚠")
         ont = None
     targets = []
     if direct:
@@ -1629,7 +2426,7 @@ def cmd_run(args):
         SEGMENT_SHORT.update(DIRECT_ONT_SHORT)
         ADVICE.update(DIRECT_ONT_ADVICE)
         targets.append(Target("ont", ont, RANK_ROUTER))
-        print(f"  Setup: this Mac → ONT {ont} (directly attached) → fiber → ISP gateway {gw}")
+        su.note(f"setup: this Mac → ONT {ont} (directly attached) → fiber → ISP gateway {gw}")
     elif gw:
         targets.append(Target("home-router", gw, RANK_ROUTER, hop=1))
     if direct:
@@ -1639,63 +2436,103 @@ def cmd_run(args):
         SEGMENT_SHORT.update(SEPARATE_ONT_SHORT)
         ADVICE.update(SEPARATE_ONT_ADVICE)
         targets.append(Target("ont", ont, RANK_ONT))
-        print(f"  Setup: router {gw} → ONT {ont} → fiber")
+        su.note(f"setup: router {gw} → ONT {ont} → fiber")
     else:
-        print(f"  Setup: home router {gw} is also the modem (fiber box / modem-router); "
-              "use --ont IP if you have a separate ONT/modem")
+        su.note(f"setup: home router {gw} is also the modem (fiber box / modem-router); "
+                "use --ont IP if you have a separate ONT/modem")
 
     stamp = time.strftime("%Y%m%d-%H%M%S")
     out_dir = os.path.join(args.out, stamp)
     os.makedirs(out_dir, exist_ok=True)
 
-    print(f"Tracing the route to {', '.join(args.hosts)}...")
-    traces = trace_all(args.hosts)
+    # one traceroute finds the routers on the way (the ISP's first hops) to probe
+    su.step(f"Tracing the route to {args.hosts[0]}, to find the ISP's routers")
+    raw, hops = trace_hops(args.hosts[0], 20)
     with open(os.path.join(out_dir, "traceroute.txt"), "w") as f:
-        for d, (raw, _) in traces.items():
-            f.write(f"== {d}\n{raw}\n")
-    raw, hops = traces[args.hosts[0]]
+        f.write(f"== {args.hosts[0]}\n{raw}\n")
     # in direct mode the gateway is hop 1 and is the ISP's first router, so probe it too
     skip = (ont, *args.hosts) if direct else (gw, ont, *args.hosts)
     first_isp = 1 if direct else 2
     hops = [(n, ip) for n, ip in hops if n <= args.hops and ip not in skip]
     pingable = answers_echo([ip for _, ip in hops])
+    found = []
     for n, ip in hops:
         if ip in pingable:
             isp = n == first_isp and (direct or not ont)
             targets.append(Target(f"hop{n}" + ("-isp" if isp else ""), ip, RANK_HOP + n, hop=n))
-            print(f"  hop {n:>2}: {ip}")
-        else:
-            print(f"  hop {n:>2}: {ip} (doesn't answer pings, skipped)")
-    for h in args.hosts:
-        hop = next((n for n, ip in traces[h][1] if ip == h), None)
-        targets.append(Target(h, h, RANK_DEST, hop=hop))
-        print(f"  hop {hop if hop else '?':>2}: {h}" + ("" if hop else " (not reached by traceroute)"))
+            found.append(f"hop{n} {ip}")
     if direct and gw and gw not in [ip for _, ip in hops] and gw in answers_echo([gw]):
         targets.append(Target("isp-gw", gw, RANK_HOP, hop=1))
-        print(f"  hop  1: {gw} (ISP gateway, answers from another address in traceroute)")
+        found.insert(0, f"isp-gw {gw}")
+    su.done(f"{len(found)} routers to probe: {', '.join(found)}" if found else "no router on the way answers pings")
+    skipped = [f"hop{n} {ip}" for n, ip in hops if ip not in pingable]
+    if skipped:
+        su.note(f"skipped, they don't answer pings: {', '.join(skipped)}")
+    for h in args.hosts:
+        targets.append(Target(h, h, RANK_DEST))
+    su.step("Destinations")
+    su.done(", ".join(f"{KNOWN_HOSTS.get(h, 'internet')} {h}" for h in args.hosts))
     if args.tcp:
+        su.step("Finding a TCP port on each (handshake timing, like real traffic)")
         tcp = ([("ont", ont, RANK_ROUTER, None)] if ont else []) + \
               [(t.name, t.addr, RANK_DEST, t.hop) for t in targets if t.rank == RANK_DEST]
+        ok, none = [], []
         for name, addr, rank, hop in tcp:
             port = open_tcp_port(addr)
             if port:
                 targets.append(Target(f"{name}:{port}", addr, rank, hop=hop, port=port))
-                print(f"  TCP {addr}:{port} (handshake timing, like real traffic)")
+                ok.append(f"{addr}:{port}")
             else:
-                print(f"  TCP {addr}: no open port 80/443, skipped")
+                none.append(addr)
+        su.done(", ".join(ok) or "none answers on port 80/443", "✓" if ok else "⚠")
+        if none:
+            su.note(f"no open port 80/443, skipped: {', '.join(none)}")
+    if args.extra:
+        su.step("Extra probes for the Tests tab (big packets, priority markings, IPv6)")
+        extra = extra_probes(targets, first_isp)
+        targets += extra
+        v6 = any(t.v6 for t in extra)
+        su.done(f"{len(extra)} probes" + ("" if v6 else ", no IPv6 on this connection"))
     targets.sort(key=lambda t: t.rank)
-    check_local_network_access(targets)
+    su.step("Checking that macOS lets this program reach the local network")
+    blocked = check_local_network_access(targets)
+    su.done(*((blocked, "⚠") if blocked else ("ok",)))
+    su.step("Checking the Mac's clock (the timer moments are measured on it)")
+    c = clock_offset()
+    clock_start = (time.time(), *c) if c else None
+    su.done(f"{c[0] * 1000:+.0f} ms off time.apple.com" if c else "time.apple.com not reachable",
+            "✓" if c else "⚠")
+    su.step("Starting the probes")
 
     full, link_samples, sampler = None, [], None
     counters_before = iface_counters(iface)
     err_samples = []    # (time, input errors) to correlate with loss events
 
     def sample_errors():
+        # this Mac's own traffic and the interface errors, every second
         while not prober.stop.is_set():
             c = iface_counters(iface)
             if c:
-                err_samples.append((time.time(), c["ierrs"]))
-            prober.stop.wait(0.5)
+                now = time.time()
+                err_samples.append((now, c["ierrs"]))
+                prober.traffic.append((now, c["ibytes"], c["obytes"], c["ierrs"]))
+            prober.stop.wait(1)
+
+    def run_status():
+        # a command of the user's (e.g. reading the ONT's optical values), logged regularly
+        while True:
+            now = time.strftime("%H:%M:%S")
+            try:
+                out = subprocess.run(args.status_cmd, shell=True, capture_output=True, text=True,
+                                     timeout=60)
+                text = out.stdout + out.stderr
+            except subprocess.TimeoutExpired:
+                text = "(timed out after 60 s)\n"
+            with open(os.path.join(out_dir, "status.txt"), "a") as f:
+                f.write(f"== {now}\n{text}\n")
+            prober.status_runs += 1
+            if prober.stop.wait(args.status_every):
+                break
     if link == "wifi":
         sampler = start_link_sampler(2.0, out_dir, link_samples)
 
@@ -1704,27 +2541,35 @@ def cmd_run(args):
     sys.setswitchinterval(0.001)
     prober = Prober(targets, args.interval)
     tracker = EventTracker(prober, link_label)
+    tracker.out_dir = out_dir
     started = time.time()
     prober.run()
     threading.Thread(target=sample_errors, daemon=True).start()
+
+    def check_clock():
+        c = clock_offset()
+        if c:
+            prober.clock_checks.append((time.time(), *c))
+    if clock_start:
+        prober.clock_checks.append(clock_start)
+    if args.status_cmd:
+        threading.Thread(target=run_status, daemon=True).start()
     tty = sys.stdout.isatty()
     term = None
+    su.done()
     if tty:
-        sys.stdout.write("\n\x1b[?25l")   # hide cursor
         if sys.stdin.isatty():
             # keys without Enter and without echo, for scrolling the events list
             term = termios.tcgetattr(sys.stdin)
             ttymode.setcbreak(sys.stdin)
             threading.Thread(target=read_keys, args=(tracker, prober.stop), daemon=True).start()
     last_plain = last_save = 0
-    drawn = 0   # lines of the previous frame, redrawn in place so the last one stays visible
     try:
         while True:
             time.sleep(0.1 if tty else 0.5)
             tracker.update()
             if tty:
-                drawn = render(prober, tracker, f"{link_label} {iface}", link_samples, started,
-                               True, drawn)
+                render(prober, tracker, f"{link_label} {iface}", link_samples, started, True)
             elif time.time() - last_plain >= 5:
                 last_plain = time.time()
                 d = tracker.done
@@ -1734,6 +2579,7 @@ def cmd_run(args):
             if time.time() - last_save >= 10:
                 last_save = time.time()
                 save_probes(prober, tracker.done, out_dir)
+                save_logs(prober, out_dir)
             if args.duration and time.time() - started >= args.duration:
                 break
             if prober.slept:
@@ -1743,9 +2589,9 @@ def cmd_run(args):
     finally:
         if term:
             termios.tcsetattr(sys.stdin, termios.TCSADRAIN, term)
-        if tty:
-            sys.stdout.write("\x1b[?25h")
-            sys.stdout.flush()
+        su.leave()
+    if tty:     # the startup steps, for the scrollback (the screen showing them is gone)
+        print("netdiag\n" + "\n".join(su.text()) + "\n")
     prober.stop.set()
     if _POOL:
         for proc in list(_POOL._processes.values()):    # don't wait for a running scan
@@ -1770,6 +2616,7 @@ def cmd_run(args):
             full = wifi_snapshot(iface)
         else:
             full = {"awdl_up": awdl_up(), "scan_skipped": router.name if router else "router"}
+    check_clock()       # again at the end: did the Mac's clock stay right?
     setup = "direct" if direct else "router+ont" if ont else "router"
     report(prober, tracker, link, iface, full, link_samples, counters_before, out_dir, err_samples,
            setup)
@@ -1810,25 +2657,161 @@ def save_probes(prober, upto, out_dir):
             f.write("round,send_time," + ",".join(t.name for t in prober.targets) + "\n")
         for n in range(start, upto):
             f.write(f"{n},{prober.send_t[n]:.4f}," + ",".join(
-                f"{t.rtt[n]:.3f}" if isinstance(t.rtt[n], float) else "" for t in prober.targets)
+                f"{t.rtt[n]:.3f}" if isinstance(t.rtt[n], float) else
+                f"{RESENT}:{t.resend_ms.get(n, 0):.0f}" if t.rtt[n] is RESENT else ""
+                for t in prober.targets)
                     + "\n")
     prober.saved = max(start, upto)
+
+
+MARK_TOS = {m: tos for m, tos, _ in MARKINGS}
+
+
+def target_from(name, row=None):
+    """A Target for a saved run, from its summary.json row, or guessed from its name (a run
+    that ended before writing one)."""
+    probe = (row or {}).get("probe", "")
+    m = re.fullmatch(r"(.+):(\d+)", name) if not name.startswith("v6-") else None
+    port = int(m.group(2)) if m else (int(probe[4:].split(",")[0]) if probe.startswith("tcp:") else None)
+    base = m.group(1) if m else name.split("·")[0]
+    size = re.search(r"(\d+) ?B(?:ytes)?$", name.split("·")[-1]) if "·" in name else None
+    mark = name.split("·")[-1] if "·" in name else None
+    hop = re.match(r"hop(\d+)", base)
+    rank = (row or {}).get("rank", RANK_ROUTER if base in ("home-router", "ont") else
+                           RANK_HOP + int(hop.group(1)) if hop else
+                           RANK_HOP + 2 if base == "v6-isp" else RANK_HOP if base == "isp-gw" else RANK_DEST)
+    v6 = name.startswith("v6-")
+    addr = (row or {}).get("addr") or (base if re.fullmatch(r"[\d.]+", base) else
+                                     {f"v6-{v.lower()}": k for k, v in V6_HOSTS.items()}.get(name, base))
+    return Target(name, addr, rank, (row or {}).get("hop"), port=port,
+                  size=int(size.group(1)) if size else None, tos=MARK_TOS.get(mark, 0), v6=v6,
+                  extra=(row or {}).get("extra", "·" in name or v6),
+                  label=f"IPv6 {V6_HOSTS[addr]}" if v6 and addr in V6_HOSTS else None)
+
+
+class Replay:
+    """A finished run read back from its folder, standing in for the Prober, so `report`
+    can analyze it again with the current version."""
+    replay = True
+    timeout, tcp_timeout, keep, status_runs = 1.0, 1.9, None, 0
+
+    def __init__(self, folder):
+        path = os.path.join(folder, "summary.json")
+        self.summary = json.load(open(path)) if os.path.exists(path) else {}
+        rows = {r["name"]: r for r in self.summary.get("targets", [])}
+        # runs from before TCP resends were told apart from losses don't know them
+        self.resent_known = any(r.get("resent") is not None for r in rows.values())
+        with open(os.path.join(folder, "probes.csv")) as f:
+            r = csv.reader(f)
+            names = next(r)[2:]
+            self.targets = [target_from(n, rows.get(n)) for n in names]
+            self.send_t = []
+            for row in r:
+                n = len(self.send_t)
+                self.send_t.append(float(row[1]))
+                for t, v in zip(self.targets, row[2:]):
+                    if not v:
+                        t.rtt.append(None)
+                    elif v.startswith(RESENT):
+                        t.rtt.append(RESENT)
+                        self.resent_known = True
+                        if ":" in v and v.split(":")[1] != "0":
+                            t.resend_ms[n] = float(v.split(":")[1])
+                    else:
+                        t.rtt.append(float(v))
+        if len(self.send_t) < 2:
+            sys.exit(f"{folder}: not enough probe rounds to analyze")
+        self.interval = self.summary.get("interval") or round(
+            (self.send_t[-1] - self.send_t[0]) / (len(self.send_t) - 1), 3)
+        self.slept = self.summary.get("slept")
+        self.misread = [0] * self.summary.get("misread", 0)
+        self.argv = self.summary.get("argv")
+        self.clock_checks = self.summary.get("clock") or []
+        self.traffic, self.quality = [], []
+        with contextlib.suppress(OSError, ValueError):
+            with open(os.path.join(folder, "traffic.csv")) as f:
+                next(f)
+                self.traffic = [tuple(float(x) for x in line.split(",")) for line in f if line.strip()]
+        with contextlib.suppress(OSError, ValueError):
+            with open(os.path.join(folder, "quality.csv")) as f:
+                next(f)
+                self.quality = [[0, float(a), float(b), int(c)] for _, a, b, c in
+                                (line.strip().split(",") for line in f if line.strip())]
+        per_round = sum(60 if t.port else (t.size or (48 if t.v6 else 20) + 8 + 25)
+                        for t in self.targets)
+        self.probe_kbps = per_round * 8 / 1000 / self.interval
+
+    def done_rounds(self):
+        return len(self.send_t)
+
+
+def cmd_report(args):
+    """Analyze a saved run again, with this version of the analysis."""
+    rp = Replay(args.dir)
+    old, kept = os.path.join(args.dir, "report.txt"), os.path.join(args.dir, "report.before.txt")
+    if os.path.exists(old) and not os.path.exists(kept):
+        shutil.copy(old, kept)      # the first report stays around for comparison
+    setup = rp.summary.get("setup", "router")
+    for text, short, advice in ((DIRECT_ONT_TEXT, DIRECT_ONT_SHORT, DIRECT_ONT_ADVICE),
+                                (SEPARATE_ONT_TEXT, SEPARATE_ONT_SHORT, SEPARATE_ONT_ADVICE)):
+        if setup == ("direct" if text is DIRECT_ONT_TEXT else "router+ont"):
+            SEGMENT_TEXT.update(text)
+            SEGMENT_SHORT.update(short)
+            ADVICE.update(advice)
+    link = rp.summary.get("link") or ("wifi" if os.path.exists(os.path.join(args.dir, "wifi.json"))
+                                       else "ethernet")
+    tracker = EventTracker(rp, "Wi-Fi" if link == "wifi" else "Ethernet/LAN")
+    tracker.out_dir = args.dir
+    print(f"Analyzing {args.dir} again ({len(rp.send_t)} probe rounds)...")
+    tracker.update()
+    full, samples = None, []
+    with contextlib.suppress(OSError, ValueError):
+        w = json.load(open(os.path.join(args.dir, "wifi.json")))
+        full, samples = w.get("scan"), w.get("samples", [])
+    errs = [(t, e) for t, _, _, e in rp.traffic]
+    report(rp, tracker, link, rp.summary.get("iface", "?"), full, samples, None, args.dir, errs, setup)
+
+
+def save_logs(prober, out_dir):
+    """The side logs: own traffic per second (appended), measurement quality per minute,
+    route changes (TTL of the replies, traceroutes) and reply markings (rewritten)."""
+    start = getattr(prober, "saved_traffic", 0)
+    rows = prober.traffic[start:]
+    with open(os.path.join(out_dir, "traffic.csv"), "a" if start else "w") as f:
+        if not start:
+            f.write("time,bytes_in,bytes_out,input_errors\n")
+        f.writelines(f"{t:.1f},{i},{o},{e}\n" for t, i, o, e in rows)
+    prober.saved_traffic = start + len(rows)
+    with open(os.path.join(out_dir, "quality.csv"), "w") as f:
+        f.write("minute,worst_send_delay_ms,worst_read_delay_ms,replies_read_too_late\n")
+        f.writelines(f"{time.strftime('%H:%M', time.localtime(m))},{a:.1f},{b:.1f},{c}\n"
+                     for m, a, b, c in list(prober.quality))
+    with open(os.path.join(out_dir, "paths.txt"), "w") as f:
+        f.write("Reply TTL / hop limit changes (a changed route) and reply markings (TOS) per target\n")
+        for t in prober.targets:
+            if t.port:
+                continue
+            tos = ", ".join(f"0x{k:02x}: {v}" for k, v in t.reply_tos.most_common())
+            f.write(f"\n{t.name} ({t.addr}): TTL {t.ttl}, reply TOS {tos or '-'}\n")
+            for when, ttl in t.ttl_changes:
+                f.write(f"  {clock(when)}  TTL → {ttl}\n")
 
 
 def _report(prober, tracker, link, iface, full, link_samples, counters_before, out_dir, err_samples,
             info):
     done = tracker.done
-    targets = prober.targets
+    # the extra probes get their statistics, but stay out of the loss analysis
+    targets = [t for t in prober.targets if not t.extra]
     if not done:
         print("Stopped before any probe round completed.")
         return None
 
-    save_probes(prober, done, out_dir)
+    replay = getattr(prober, "replay", False)
+    if not replay:         # a replay keeps the raw data as it is
+        save_probes(prober, done, out_dir)
+        save_logs(prober, out_dir)
     with open(os.path.join(out_dir, "events.json"), "w") as f:
         json.dump([{**e, "targets": sorted(e["targets"])} for e in tracker.events], f, indent=1)
-    with open(os.path.join(out_dir, "events.txt"), "w") as f:
-        f.write("time        type    lasted  targets\n")
-        f.writelines(event_line(e, prober.interval, False) + "\n" for e in tracker.events)
     if link_samples or full:
         with open(os.path.join(out_dir, "wifi.json"), "w") as f:
             json.dump({"scan": full, "samples": link_samples}, f, indent=1)
@@ -1836,7 +2819,8 @@ def _report(prober, tracker, link, iface, full, link_samples, counters_before, o
     dur = prober.send_t[done - 1] - prober.send_t[0]
     print(f"\nRan {dur / 60:.1f} min, {done} probe rounds every {prober.interval * 1000:.0f} ms. "
           f"Raw data: {out_dir}/")
-    print(f"Command: {' '.join(['netdiag.py'] + sys.argv[1:])}")
+    print(f"Command: {' '.join(['netdiag.py'] + (getattr(prober, 'argv', None) or sys.argv[1:]))}"
+          + ("  (analyzed again with this version)" if replay else ""))
     if prober.slept:
         print(f"Stopped early: the Mac went to sleep at "
               f"{time.strftime('%H:%M:%S', time.localtime(prober.slept[0]))}.")
@@ -1850,12 +2834,15 @@ def _report(prober, tracker, link, iface, full, link_samples, counters_before, o
 
     findings = []
     stats = {}
-    for t in targets:
+    for t in prober.targets:
         series = analyze_series({n: t.rtt[n] for n in range(done)}, prober.interval)
+        series["tcp"] = bool(t.port)
         stats[t.name] = series
-        print_series(f"{t.name} ({t.addr}, hop {t.hop or '?'}, {probe_label(t)})", series)
+        print_series(f"{t.name} ({t.addr}, {probe_label(t)})", series)
         if t.late:
             print(f"  late      {t.late} replies arrived after the {prober.timeout:.0f}s timeout")
+        if t.extra:
+            continue
         if t.rank == RANK_ROUTER:
             findings += findings_for(series, t.name, link, modes=not t.port)
         elif t.rank == RANK_DEST:
@@ -1870,10 +2857,28 @@ def _report(prober, tracker, link, iface, full, link_samples, counters_before, o
     # loss over time: only the timers that are statistically significant over the whole run
     first, last = prober.send_t[0], prober.send_t[done - 1]
     timers = scan_views(tracker.loss_t, first, last, prober.interval, None, guesses=0)[0][5]
+    info["timers"] = [{"period": c["period"], "phase": round(c["phase"], 3), "hits": c["hits"],
+                       "cycles": c["cycles"]} for c in timers if significance(c) == 2]
+    tracker.timers = [c for c in timers if significance(c) == 2]
+    with open(os.path.join(out_dir, "events.txt"), "w") as f:     # losses at a timer tagged
+        f.write("time        type    lasted  targets\n")
+        f.writelines(event_line(e, prober.interval, False, tracker.timers) + "\n"
+                     for e in tracker.events)
     print("\n── Loss over time " + "─" * 44)
     for line in loss_over_time(tracker.isp_loss, first, last, prober.interval, timers, 80, False,
                                False):
         print(line)
+    comp = comparisons(prober, tracker)
+    info["comparisons"] = comp
+    if comp:
+        print("\n── Comparisons " + "─" * 47)
+        for topic, text in comp:
+            print(f"  {topic:<18}" + wrap(text, 58, " " * 20))
+    trend = trend_lines(prober, tracker, 120, False, link_samples)
+    if trend:
+        print("\n── Trends: what changed over the run " + "─" * 25)
+        for line in trend:
+            print(line)
 
     findings = localize(tracker, targets, stats, prober.interval, info) + findings
     per = tracker.period(force=True)
@@ -1884,7 +2889,7 @@ def _report(prober, tracker, link, iface, full, link_samples, counters_before, o
                   if abs((prober.send_t[n] - per["phase"] + P / 2) % P - P / 2) <= w]
         alive = sorted((t for t in targets if t.name not in tracker.dead),
                        key=lambda t: (t.rank, t.port or 0))
-        hit = [t for t in alive if any(t.rtt[n] is None for n in in_win)]
+        hit = [t for t in alive if any(is_lost(t.rtt[n]) for n in in_win)]
         where = ""
         if hit and hit[0] is not alive[0]:
             ok = [t.name for t in alive[:alive.index(hit[0])]]
@@ -1904,7 +2909,7 @@ def _report(prober, tracker, link, iface, full, link_samples, counters_before, o
     if link == "wifi":
         wifi = [{**(full or {}), **s} for s in link_samples] or ([full] if full else [])
         findings += wifi_findings(wifi)
-    else:
+    elif not replay:       # today's interface counters say nothing about an old run
         findings += ethernet_findings(iface, counters_before, iface_counters(iface))
     findings += error_correlation(tracker, err_samples, iface)
     print_findings(findings)
@@ -1920,12 +2925,16 @@ def write_summaries(prober, tracker, stats, info, link, setup, out_dir):
         rows.append({"name": t.name, "addr": t.addr, "hop": t.hop, "probe": probe_label(t),
                      "rank": t.rank, "sent": r["sent"], "lost": r["lost"],
                      "loss_pct": round(r["loss_pct"], 3),
+                     "resent": r.get("resent", 0) if getattr(prober, "resent_known", True) else None,
                      "p50": round(r["p50"], 2) if "p50" in r else None,
-                     "silent": t.name in tracker.dead})
+                     "silent": t.name in tracker.dead, "extra": t.extra})
     summary = {"start": prober.send_t[0], "end": prober.send_t[done - 1], "rounds": done,
                "interval": prober.interval, "link": link, "setup": setup, "targets": rows,
                "verdict": info.get("verdict"), "shared": info.get("shared"),
-               "periodic": info.get("periodic"), "slept": prober.slept, "misread": len(prober.misread), "argv": sys.argv[1:]}
+               "periodic": info.get("periodic"), "comparisons": info.get("comparisons"),
+               "slept": prober.slept, "misread": len(prober.misread),
+               "timers": info.get("timers"), "clock": prober.clock_checks,
+               "argv": getattr(prober, "argv", None) or sys.argv[1:]}
     with open(os.path.join(out_dir, "summary.json"), "w") as f:
         json.dump(summary, f, indent=1)
 
@@ -1937,26 +2946,46 @@ def cmd_summarize(args):
     if not paths:
         sys.exit("No summary.json found (runs made with this version of netdiag write one).")
     head = ("| start | min | setup | probe | first device | ISP first hop | internet ICMP "
-            "| internet TCP | loss starts | periodic |")
-    lines = [head, "|" + "---|" * 10]
+            "| internet TCP: resent / lost | loss starts | timers | tests |")
+    lines = [head, "|" + "---|" * 11]
     for p in paths:
         s = json.load(open(p))
-        live = [t for t in s["targets"] if not t["silent"]]
+        live = [t for t in s["targets"] if not t["silent"] and not t.get("extra")]
         icmp = [t for t in live if t["probe"] == "icmp"]
         first = next((t for t in icmp if t["rank"] == RANK_ROUTER), None)
         hops = [t for t in icmp if RANK_HOP <= t["rank"] < RANK_DEST]
         isp = min(hops, key=lambda t: t["rank"]) if hops else None
         med = lambda ts: f"{statistics.median(t['loss_pct'] for t in ts):.2f}%" if ts else "-"
         dest_icmp = [t for t in icmp if t["rank"] == RANK_DEST]
-        dest_tcp = [t for t in live if t["probe"] != "icmp" and t["rank"] == RANK_DEST]
+        dest_tcp = [t for t in live if t["probe"].startswith("tcp") and t["rank"] == RANK_DEST]
+        # TCP: loss_pct counts resends too; "resent" (newer runs) says how many of them
+        tcp = "-"
+        if dest_tcp:
+            res = statistics.median(100 * (t.get("resent") or 0) / max(1, t["sent"]) for t in dest_tcp)
+            tcp = f"{res:.2f}% / {statistics.median(t['loss_pct'] for t in dest_tcp) - res:.2f}%" \
+                if all(t.get("resent") is not None for t in dest_tcp) else med(dest_tcp) + " (not split)"
+        timers = ", ".join(f"{c['period']} s ({100 * c['hits'] / c['cycles']:.0f}%)"
+                           for c in s.get("timers") or []) or (
+            f"{s['periodic']['period']} s" if s.get("periodic") else "-")
+        # tests in short: = no clear difference, ≠ a clear one; direction as down / up
+        short = {"Packet size": "size", "Priority marking": "marking", "IPv4 vs IPv6": "IPv6"}
+        tests = []
+        for topic, text in s.get("comparisons") or []:
+            if topic in short:
+                tests.append(f"{short[topic]} {'=' if 'no clear difference' in text else '≠'}")
+            elif topic == "Direction" and "→ you" in text:
+                m = re.search(r"ISP → you ([\d.]+%), you → ISP ([\d.]+%)", text)
+                if m:
+                    tests.append(f"down {m.group(1)} / up {m.group(2)}")
+        tests = ", ".join(dict.fromkeys(tests)) or "-"
         v = s.get("verdict")
         fmt = lambda t: f"{t['name']} {t['loss_pct']:.2f}%" if t else "-"
         lines.append(
             f"| {time.strftime('%a %Y-%m-%d %H:%M', time.localtime(s['start']))} "
             f"| {(s['end'] - s['start']) / 60:.0f} | {s['setup']}/{s['link']} "
             f"| {s['interval'] * 1000:.0f} ms | {fmt(first)} | {fmt(isp)} | {med(dest_icmp)} "
-            f"| {med(dest_tcp)} | {(v['from'] + ' → ' + v['to']) if v else 'unclear'} "
-            f"| {period_text(s['periodic']) if s.get('periodic') else '-'} |")
+            f"| {tcp} | {(v['from'] + ' → ' + v['to']) if v else 'unclear'} "
+            f"| {timers} | {tests} |")
     out = "\n".join(lines)
     print(out)
     if args.out:
@@ -2333,11 +3362,22 @@ def main():
                                  "(default: the home router is also the modem, e.g. a fiber box with built-in router)")
     r.add_argument("--hops", type=int, default=5,
                    help="trace this many hops towards the first host and probe them (default 5)")
-    r.add_argument("--hosts", nargs="+", default=["1.1.1.1", "8.8.8.8"])
+    # four destinations behind different exits of a typical ISP (an internet exchange,
+    # direct links to big networks, transit carriers), so a problem on one path shows up
+    r.add_argument("--hosts", nargs="+",
+                   default=["1.1.1.1", "8.8.8.8", "208.67.222.222", "185.15.58.224"])
     r.add_argument("--no-tcp", dest="tcp", action="store_false",
                    help="don't add TCP handshake probes (port 80/443) to the ONT and internet hosts")
+    r.add_argument("--no-extra", dest="extra", action="store_false",
+                   help="don't add the extra probes (big packets, priority markings, IPv6)")
+    r.add_argument("--status-cmd", help="shell command whose output is logged to status.txt "
+                   "regularly, e.g. one that reads the ONT's optical values")
+    r.add_argument("--status-every", type=int, default=300, help="seconds between --status-cmd runs")
     r.add_argument("--out", default="netdiag-logs")
     r.set_defaults(func=cmd_run)
+    rp = sub.add_parser("report", help="analyze a saved run again with this version")
+    rp.add_argument("dir", help="the run's folder, e.g. netdiag-logs/20261109-231641")
+    rp.set_defaults(func=cmd_report)
     sm = sub.add_parser("summarize", help="compare saved runs side by side")
     sm.add_argument("dirs", nargs="*", default=["netdiag-logs"])
     sm.add_argument("--out", default="netdiag-logs/summary.md", help="also save the table here")
