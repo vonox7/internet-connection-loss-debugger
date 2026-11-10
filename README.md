@@ -31,10 +31,15 @@ Privacy & Security → Local Network) to reach the router; the tool warns you if
 - **Probes**: per station its loss, latency and a timeline with one column per second: the
   bar shows how much slower than usual it answered (yellow █ = latency spike), the digit
   below how many probes got lost in that second. A row flashes the moment a probe is lost.
+- **Loss over time**: a chart with one column per 10 minutes (coarser on long runs, up to
+  24 h) and the loss per hour, split into the regular timers found below and the random
+  rest. Loss that rises and falls with the time of day (high in the evening, low at 3 am)
+  points to an overloaded network rather than a damaged line.
 - **Regular loss intervals**: checks whether losses repeat on a fixed timer (every 1–300 s,
   at the same moment of the cycle), with the moment, how tightly the losses cluster, how
   fast the moment drifts, and how likely that pattern is pure luck. A device that runs a
-  periodic job and briefly stops forwarding shows up here.
+  periodic job and briefly stops forwarding shows up here. Press `h` for an explanation
+  of the columns.
 - **Events**: every loss / spike with time, duration and which stations were hit.
   Scroll with ↑/↓, PgUp/PgDn, Home/End.
 
@@ -86,7 +91,7 @@ If the loss starts right after your router, the next question is: the router, or
 router's job itself:
 
 ```sh
-./ont-connect.sh                  # asks for the ISP's internet VLAN
+./ont-connect.sh                  # asks for the ISP's internet VLAN (Enter = 31)
 ./ont-connect.sh --vlan 7         # ISP delivers internet on VLAN 7
 ./ont-connect.sh --no-vlan        # ISP delivers internet untagged
 ./ont-connect.sh --browser        # also open the ONT's web page (optical levels, errors)

@@ -963,8 +963,10 @@ class EventTracker:
         self.dead = set()           # targets that don't answer at all (ignored)
         self.loss_t = []            # send times of rounds where something was lost
         self.lost = Counter()       # target name -> lost probes so far
+        self.isp_loss = []          # (send time, share of the ISP-side targets that lost it)
         self.periodic, self._period_at = None, 0
         self.scroll, self.seen, self.page = 0, 0, 1    # dashboard: events list position
+        self.show_help = False      # dashboard: the explanation of the interval table (h key)
 
     def update(self):
         upto = self.p.done_rounds()
@@ -994,6 +996,11 @@ class EventTracker:
                     self.windows[t.name].append(v)
             if lost:
                 self.loss_t.append(self.p.send_t[n])
+                # ISP side = everything after the home router / ONT
+                isp = [t for t in alive if t.rank > RANK_ONT]
+                bad = sum(1 for t in isp if t.rtt[n] is None)
+                if bad:
+                    self.isp_loss.append((self.p.send_t[n], bad / len(isp)))
             self._feed("loss", n, lost, alive)
             self._feed("spike", n, spiky, alive)
             for name, w in self.windows.items():
@@ -1108,19 +1115,18 @@ def vis_len(s):
 
 INTERVAL_HELP = (
     "A device on the path may run a job every few seconds that briefly loses packets. Every "
-    "interval in the range shown and every moment within it is tried. \"when\" = at which moment of the "
-    "cycle the losses happen, as seconds of the clock: \"at :24.19 and :54.19 of every "
-    "minute\" = 12:00:24.19, 12:00:54.19, 12:01:24.19, …; intervals that don't fit evenly "
-    "into a minute show the clock time of their first loss. "
-    "\"spread\" = how tightly the losses cluster around that moment; \"drift\" = how fast "
-    "that moment moves (a device clock running slightly fast or slow; measured from 30 min); "
-    "\"seen\" = in how many cycles there was a loss at that moment, \"expected\" = how many "
-    "cycles would have a loss at that moment anyway, if the same number of losses happened at "
-    "random times. \"Chance it's "
-    "just luck\" says how "
-    "rarely random loss alone would produce the best pattern found (taking into account that "
-    "all intervals were searched): 1 in 10 000 or rarer is statistically significant, 1 in "
-    "1 000 possibly significant (a longer run will tell).")
+    "interval in the range shown and every moment within it is tried. \"when\" = at which "
+    "moment of the cycle the losses happen, as seconds of the clock: \"at :24.19 and :54.19 of "
+    "every minute\" = 12:00:24.19, 12:00:54.19, 12:01:24.19, …; intervals that don't fit evenly "
+    "into a minute show the clock time of their first loss. \"spread\" = how tightly the losses "
+    "cluster around that moment; \"drift\" = how fast that moment moves (a device clock running "
+    "slightly fast or slow; measured from 30 min); \"seen\" = in how many cycles there was a "
+    "loss at that moment, \"expected\" = how many cycles would have a loss at that moment "
+    "anyway, if the same number of losses happened at random times. \"Chance it's just luck\" "
+    "says how rarely random loss alone would produce the best pattern found (taking into "
+    "account that all intervals were searched): 1 in 10 000 or rarer is statistically "
+    "significant, 1 in 1 000 possibly significant (a longer run will tell). Only those are "
+    "listed; without any, the best guess is shown.")
 
 
 def odds(p):
@@ -1161,6 +1167,7 @@ def phase_drift(c, times):
     slope = sum((t - mt) * (d - md) for t, d in pts) / var
     resid = sum((d - md - slope * (t - mt)) ** 2 for t, d in pts) / (len(pts) - 2)
     se = math.sqrt(resid / var)
+    c["drift_fit"] = (mt, md, slope)       # where the moment is at any time (see at_timer)
     # only a trend clearly larger than its uncertainty counts
     return slope * 3600 if abs(slope) > 3 * se else 0.0
 
@@ -1177,7 +1184,8 @@ def interval_blocks(prober, tracker, use_color, window_s=300):
     tracker._intervals_every = every
     if busy and busy.done():
         try:
-            tracker._intervals = (tracker._intervals_at, _interval_blocks(busy.result(), use_color))
+            tracker._views = busy.result()
+            tracker._intervals = (tracker._intervals_at, _interval_blocks(tracker._views, use_color))
         except Exception:
             tracker._intervals_at = now     # keep showing the previous result
         busy = tracker._intervals_busy = None
@@ -1195,7 +1203,8 @@ def interval_blocks(prober, tracker, use_color, window_s=300):
             _POOL = concurrent.futures.ProcessPoolExecutor(1, initializer=_ignore_sigint)
         tracker._intervals_busy, tracker._intervals_at = _POOL.submit(scan_views, *job), now
         return cache[1]
-    tracker._intervals = (now, _interval_blocks(scan_views(*job), use_color))
+    tracker._views = scan_views(*job)
+    tracker._intervals = (now, _interval_blocks(tracker._views, use_color))
     return tracker._intervals[1]
 
 
@@ -1206,11 +1215,12 @@ def _ignore_sigint():
     signal.signal(signal.SIGINT, signal.SIG_IGN)     # Ctrl+C is the main process's business
 
 
-def scan_views(loss_t, first, end, interval, window_s):
+def scan_views(loss_t, first, end, interval, window_s, guesses=5):
     """Loss intervals for the whole run and, once it's long enough, the last `window_s`
-    seconds: [(label, start, end, interval, losses, candidates)]."""
+    seconds (None: whole run only): [(label, start, end, interval, losses, candidates)].
+    Candidates: all (possibly) significant ones, filled up to `guesses` with the best others."""
     views = [("whole run", first)]
-    if end - first > 2 * window_s:   # the moment of a timer can drift
+    if window_s and end - first > 2 * window_s:   # the moment of a timer can drift
         views.append((f"last {window_s // 60} min", end - window_s))
     out = []
     for label, start in views:
@@ -1219,8 +1229,8 @@ def scan_views(loss_t, first, end, interval, window_s):
         found, masked = [], 0.0
         while len(found) < 8:
             cands = period_scan(times, start, end, interval, masked=masked)
-            if not cands or (len(found) >= 5 and not significance(cands[0])):
-                break       # the 5 best guesses, plus any further (possibly) significant ones
+            if not cands or (len(found) >= guesses and not significance(cands[0])):
+                break       # the best guesses, plus any further (possibly) significant ones
             cands[0]["drift"] = phase_drift(cands[0], times)
             found.append(cands[0])
             # losses this interval explains don't count for the next candidate (a 30 s timer
@@ -1247,12 +1257,13 @@ def _interval_blocks(views, use_color):
                 sig and f"{sig} statistically significant interval{'s' * (sig != 1)}",
                 maybe and f"{maybe} possibly significant") if x)
         else:
-            summary = "no statistically significant interval (best guesses below)"
+            summary = "nothing statistically significant (best guess below)"
         lo, hi = 1 if interval <= 0.2 else 5, int(min(300, (end - start) / 3))
         checked = f"intervals {lo}–{hi} s checked" if hi >= lo and n >= 4 else "nothing checked yet"
         out = [color(f"{label}: {n} losses in {(end - start) / 60:.1f} min", "1", use_color)
-               + color(f" · {checked}", GREY, use_color),
-               "  " + summary]
+               + color(f" · {checked} · ", GREY, use_color) + summary]
+        # the (possibly) significant ones; without any, just the best guess
+        found = [c for c in found if significance(c)] or found[:1]
         ats = [moment_text(c["period"], c["phase"], start) for c in found]
         aw = max([len(a) for a in ats] + [4])
         if found:
@@ -1270,6 +1281,160 @@ def _interval_blocks(views, use_color):
                        + color(label, code, use_color))
         blocks.append(out)
     return blocks
+
+
+# blue: loss at a regular timer, in the loss-over-time chart. The terminal's own blue, like
+# the red: as text and as background it's the same color.
+TIMER_COLOR, TIMER_BG = "34", "44"
+
+
+def at_timer(c, t):
+    """Is a loss at time `t` one of timer candidate `c`'s (within its window around its
+    moment, the same one the interval table uses, following the drift if there is one)?"""
+    P = c["period"]
+    d = (t - c["phase"] + P / 2) % P - P / 2
+    if c.get("drift") and c.get("drift_fit"):
+        mt, md, slope = c["drift_fit"]
+        d -= md + slope * (t - mt)
+    return abs(d) <= c["window"]
+
+
+def loss_by_time(losses, start, end, interval, timers, size):
+    """Loss per wall-clock bucket of `size` seconds: [bucket start, probe rounds, lost probes
+    (in rounds), of those per timer], from (time, share of the ISP-side probes lost) per round.
+    A round at several timers' moments counts for the first."""
+    off = time.localtime(start).tm_gmtoff        # buckets start on the local full hour
+    first = (start + off) // size * size - off
+    buckets = []
+    b = first
+    while b < end:
+        buckets.append([b, max(1.0, (min(b + size, end) - max(b, start)) / interval), 0,
+                        [0] * len(timers)])
+        b += size
+    for t, share in losses:
+        i = int((t - first) // size)
+        if t < start or not 0 <= i < len(buckets):
+            continue
+        row = buckets[i]
+        row[2] += share
+        k = next((k for k, c in enumerate(timers) if at_timer(c, t)), None)
+        if k is not None:
+            row[3][k] += share
+    return buckets
+
+
+def loss_chart(losses, start, end, interval, timers, width, use_color, height=5, legend=True):
+    """Bar chart of the loss over time, one column per 10 min (coarser if that doesn't fit
+    `width`): average loss of the ISP-side targets; red = random (at the bottom), blue on top =
+    at one of `timers`."""
+    for size in (600, 1200, 1800, 3600):
+        buckets = loss_by_time(losses, start, end, interval, timers, size)
+        if len(buckets) <= width - 9:
+            break
+    pct = [100 * b[2] / b[1] for b in buckets]
+    tpct = [100 * sum(b[3]) / b[1] for b in buckets]
+    top = max(pct) or 0.01
+    rows = []
+    for r in range(height - 1, -1, -1):
+        row = ""
+        for p, tp in zip(pct, tpct):
+            tot = max(1 if p else 0, round(p / top * height * 8))
+            rnd = round((p - tp) / top * height * 8)
+            fill = min(8, max(0, tot - 8 * r))
+            rfill = min(8, max(0, rnd - 8 * r))
+            if fill == 8 and 0 < rfill < 8 and use_color:
+                # random part ends inside a full cell: red block on a blue background (the red
+                # is the usual bold red, which terminals don't use for backgrounds)
+                row += color(SPARK[rfill], f"1;31;{TIMER_BG}", True)
+            elif fill:
+                row += color(SPARK[fill], "1;31" if 2 * rfill >= fill else TIMER_COLOR, use_color)
+            else:
+                row += " "
+        label = f"{top:5.2f}% ┤" if r == height - 1 else "       │"
+        rows.append(color(label, GREY, use_color) + row)
+    if legend:
+        rows.append(color("       └" + "─" * len(buckets), GREY, use_color))
+    # clock times under the columns that start a full hour, and the start if there's room
+    axis, free = [" "] * (len(buckets) + 8), 0
+    hours = [i for i, b in enumerate(buckets) if b[0] >= start and time.localtime(b[0]).tm_min == 0]
+    if not hours or hours[0] >= 6:
+        hours.insert(0, 0)
+    for i in hours:
+        if i >= free:
+            axis[8 + i:8 + i + 5] = time.strftime("%H:%M", time.localtime(max(buckets[i][0], start)))
+            free = i + 6
+    rows.append(color("".join(axis).rstrip(), GREY, use_color))
+    if not legend:
+        return rows, size
+    names = ", ".join(f"every {c['period']} s" for c in timers)
+    rows.append("        " + color("█", "1;31", use_color) + " random loss   " + (
+        color("█", TIMER_COLOR, use_color) + f" at a regular timer ({names})" if timers else
+        color("no statistically significant timer found", GREY, use_color)))
+    return rows, size
+
+
+def hourly_rows(losses, start, end, interval, timers):
+    """Per local hour: (start, loss %, random %, [% per timer])."""
+    out = []
+    for b, rounds, lost, per in loss_by_time(losses, start, end, interval, timers, 3600):
+        out.append((max(b, start), 100 * lost / rounds, 100 * (lost - sum(per)) / rounds,
+                    [100 * n / rounds for n in per]))
+    return out
+
+
+def loss_over_time(losses, start, end, interval, timers, cols, use_color, live):
+    """The loss-over-time section: chart, then the loss per hour split into the timers and
+    the rest (live: hours as columns, newest that fit; report: hours as rows)."""
+    sig = [c for c in timers if significance(c) == 2]
+    # live also shows the possibly significant ones (a longer run will tell), not the guesses
+    timers = [c for c in timers if significance(c) >= (1 if live else 2)]
+    chart, size = loss_chart(losses, start, end, interval, sig, cols - 1, use_color,
+                             5, legend=not live)
+    what = (f"average loss of the targets after your router / ONT (the ISP side), "
+            f"{size // 60} min per column")
+    hours = hourly_rows(losses, start, end, interval, timers)
+    if live:
+        return [headline(f"Loss over time · {what}", cols, use_color)] + _live_hours(
+            chart, hours, timers, cols, use_color)
+    out = [color(f"  {what}", HELP, use_color)] + chart + [""]
+    labels = [("loss", "1"), ("random", "")] + [
+        (f"every {c['period']} s", SIGNIFICANCE[significance(c)][1] if significance(c) < 2 else "")
+        for c in timers]
+    out.append(color("  hour " + "".join(f"{l:>{max(8, len(l) + 2)}}" for l, _ in labels),
+                     GREY, use_color))
+    for h in hours:
+        vals = [h[1], h[2]] + h[3]
+        out.append(f"  {time.strftime('%H:%M', time.localtime(h[0]))}" + "".join(
+            f"{v:>{max(8, len(l) + 2) - 1}.2f}%" for v, (l, _) in zip(vals, labels)))
+    return out
+
+
+def _live_hours(chart, hours, timers, cols, use_color):
+    """Chart and loss per hour (hours as columns) side by side, or stacked if both don't fit.
+    The row labels double as the chart's legend: red = random, blue = timer."""
+    labels = [("loss", "", "1"), ("random", "1;31", ""), *(
+        (f"every {c['period']} s" + ("" if significance(c) == 2 else " (maybe)"),
+         TIMER_COLOR if significance(c) == 2 else "", "" if significance(c) == 2 else WARN)
+        for c in timers)]
+    lw = max(len(l) for l, _, _ in labels) + 4
+
+    def table(n):
+        hs = hours[-n:]
+        rows = [color(" " * lw + "".join(f"{time.strftime('%H:%M', time.localtime(h[0])):>7}"
+                                         for h in hs), GREY, use_color)]
+        for k, (label, block, code) in enumerate(labels):
+            vals = [h[1] if k == 0 else h[2] if k == 1 else h[3][k - 2] for h in hs]
+            head = (color("█ ", block, use_color) if block else "  ") + label
+            rows.append(color(head + " " * (lw - len(label) - 2), code, use_color and bool(code))
+                        + "".join(f"{v:6.2f}%" for v in vals))
+        return rows
+
+    cw = max(map(vis_len, chart)) + 4
+    if cw + lw + 7 * len(hours) <= cols - 1:     # everything fits next to the chart
+        right = table(len(hours))
+        return [(chart[i] if i < len(chart) else "") + " " * (cw - vis_len(chart[i] if i < len(chart) else ""))
+                + (right[i] if i < len(right) else "") for i in range(max(len(chart), len(right)))]
+    return chart + table(max(1, (cols - 1 - lw) // 7))
 
 
 def clock(t, decimals=1):
@@ -1320,7 +1485,7 @@ def read_keys(tracker, stop):
     fd = sys.stdin.fileno()
     keys = {b"\x1b[A": 1, b"k": 1, b"\x1b[B": -1, b"j": -1, b"\x1b[5~": "pg", b"\x1b[6~": "-pg",
             b"\x1b[H": "home", b"\x1b[1~": "home", b"g": "home",
-            b"\x1b[F": "end", b"\x1b[4~": "end", b"G": "end"}
+            b"\x1b[F": "end", b"\x1b[4~": "end", b"G": "end", b"h": "help", b"?": "help"}
     while not stop.is_set():
         if not select.select([fd], [], [], 0.2)[0]:
             continue
@@ -1329,7 +1494,9 @@ def read_keys(tracker, stop):
             k = tracker.page
         elif k == "-pg":
             k = -tracker.page
-        if k == "home":
+        if k == "help":
+            tracker.show_help = not tracker.show_help
+        elif k == "home":
             tracker.scroll = len(tracker.events)
         elif k == "end":
             tracker.scroll = 0
@@ -1394,6 +1561,16 @@ def render(prober, tracker, link_desc, wifi_now, started, use_color, drawn):
         lines.append("    " + color(name, GREY, use_color) + " " * (left_w - 10 - aw)
                      + color("lost/s", GREY, use_color) + "   " + paint(lossc))
     lines.append("")
+    views = getattr(tracker, "_views", None)
+    cache = getattr(tracker, "_over_time", None)
+    if done and (not cache or time.time() - cache[0] >= 10 or cache[1] is not views
+                 or cache[2] != cols):
+        timers = views[0][5] if views else []
+        cache = tracker._over_time = (time.time(), views, cols, loss_over_time(
+            tracker.isp_loss, prober.send_t[0], prober.send_t[done - 1], prober.interval, timers,
+            cols, use_color, True))
+    if cache:
+        lines += cache[3] + [""]
     blocks = interval_blocks(prober, tracker, use_color)
     if getattr(tracker, "_intervals_busy", None):
         status = "recalculating…"
@@ -1401,9 +1578,10 @@ def render(prober, tracker, link_desc, wifi_now, started, use_color, drawn):
         age = time.time() - tracker._intervals[0]
         status = (f"updated {age:.0f} s ago, next in "
                   f"{max(0, tracker._intervals_every - age):.0f} s")
-    lines.append(headline(f"Regular loss intervals · {status}", cols, use_color))
-    lines += [color(l, HELP, use_color) for l in wrap(INTERVAL_HELP, cols - 2, "").split("\n")]
-    lines.append("")
+    lines.append(headline(f"Regular loss intervals · {status} · h = "
+                          + ("hide help" if tracker.show_help else "help"), cols, use_color))
+    if tracker.show_help:
+        lines += [color(l, HELP, use_color) for l in wrap(INTERVAL_HELP, cols - 2, "").split("\n")]
     w = max(map(vis_len, blocks[0])) + 6
     if len(blocks) == 2 and cols - 1 >= w + max(map(vis_len, blocks[1])):  # side by side
         for i in range(max(map(len, blocks))):
@@ -1689,6 +1867,14 @@ def _report(prober, tracker, link, iface, full, link_samples, counters_before, o
     findings += loss_pattern([t for t in targets if t.rank == RANK_DEST], stats,
                              "ethernet" if local_clean else link)
 
+    # loss over time: only the timers that are statistically significant over the whole run
+    first, last = prober.send_t[0], prober.send_t[done - 1]
+    timers = scan_views(tracker.loss_t, first, last, prober.interval, None, guesses=0)[0][5]
+    print("\n── Loss over time " + "─" * 44)
+    for line in loss_over_time(tracker.isp_loss, first, last, prober.interval, timers, 80, False,
+                               False):
+        print(line)
+
     findings = localize(tracker, targets, stats, prober.interval, info) + findings
     per = tracker.period(force=True)
     info["periodic"] = per
@@ -1908,7 +2094,27 @@ def period_scan(times, start, end, interval=0.05, max_period=300, masked=0.0):
     # correct for that (Bonferroni) by the number of windows tried.
     for c in found:
         c["p_adj"] = min(1.0, c["p"] * tests)
-    return sorted(found, key=lambda c: c["p"])
+    found.sort(key=lambda c: c["p"])
+    # A timer every 30 s makes every 6 s (10 s, 15 s) look regular too: one of the 6 s moments
+    # always hits, and the shorter interval has more cycles, so it can win on odds. Then
+    # most of the 6 s hits sit in one of the five 6 s slots of a 30 s cycle, while a real
+    # 6 s timer spreads them evenly (1/k each): take the multiple if its slot holds clearly
+    # more than that, halfway to all of them.
+    changed = True
+    while found and changed:
+        changed, best = False, found[0]
+        P = best["period"]
+        for m in sorted(found, key=lambda c: c["period"]):
+            k = m["period"] // P
+            if (m["period"] > P and m["period"] % P == 0 and significance(m)
+                    and m["hits"] >= (1 + 1 / k) / 2 * best["hits"]
+                    and abs((m["phase"] - best["phase"] + P / 2) % P - P / 2)
+                    <= best["window"] + m["window"]):
+                found.remove(m)
+                found.insert(0, m)
+                changed = True
+                break
+    return found
 
 
 def find_period(times, start, end, interval, max_period=300):

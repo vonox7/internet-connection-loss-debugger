@@ -5,7 +5,7 @@
 # terminal window.
 #
 # Usage: unplug the router from the ONT's LAN port, plug in the Mac, then run:
-#            ./ont-connect.sh                    # asks for the ISP's internet VLAN
+#            ./ont-connect.sh                    # asks for the ISP's internet VLAN (Enter = 31)
 #            ./ont-connect.sh --vlan 7           # ISP delivers internet on VLAN 7
 #            ./ont-connect.sh --no-vlan          # ISP delivers internet untagged
 #            ./ont-connect.sh --ont 10.0.0.138   # ONT management address (default 192.168.100.1)
@@ -19,6 +19,7 @@
 
 ONT_IP=192.168.100.1
 VLAN=""     # empty = ask; "none" = untagged
+DEFAULT_VLAN=31
 VLAN_NAME="ont-connect-vlan"
 DIR=$(cd "$(dirname "$0")" && pwd)
 
@@ -123,9 +124,9 @@ main() {
     bold "ONT direct-connect: test the fiber line without the home router"
     if [ -z "$VLAN" ]; then
         echo "  Which VLAN does your ISP deliver internet on? It's in your router's internet /"
-        echo "  WAN settings (\"VLAN ID\", \"802.1Q\"). Leave empty if there is none (untagged)."
-        VLAN=$(ask "VLAN ID:")
-        [ -z "$VLAN" ] && VLAN=none
+        echo "  WAN settings (\"VLAN ID\", \"802.1Q\"). Type \"none\" if there is none (untagged)."
+        VLAN=$(ask "VLAN ID [$DEFAULT_VLAN]:")
+        VLAN=${VLAN:-$DEFAULT_VLAN}
     fi
     case "$VLAN" in
         none) ;;
