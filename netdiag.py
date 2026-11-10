@@ -1128,14 +1128,15 @@ class EventTracker:
         self.lost = Counter()       # target name -> lost probes so far
         self.resent = Counter()     # target name -> TCP probes answered only after a resend
         self.hist = {t.name: {} for t in prober.targets}    # see update()
-        self.tz = time.localtime().tm_gmtoff      # buckets start on the local 10 minutes
+        self.tz = time.localtime().tm_gmtoff      # buckets start on the local minute
         # per round with a loss on the ISP side (after the home router / ONT): (send time,
         # share of those targets) for ICMP lost, TCP lost and TCP resent
         self.isp_loss = {"icmp": [], "tcp_lost": [], "tcp_resent": []}
         self.periodic, self._period_at = None, 0
         self.scroll, self.seen, self.page = 0, 0, 1    # dashboard: events list position
         self.show_help = False      # dashboard: the explanation of the interval table (h key)
-        self.view = 0               # dashboard: index into VIEWS (1-4, ←/→, Tab)
+        self.view = 0               # dashboard: index into VIEWS (1-6, ←/→, Tab)
+        self.trend_sel = None       # dashboard: highlighted line in a trend tab (↑/↓)
         self.out_dir = ""
 
     def update(self):
@@ -1152,8 +1153,8 @@ class EventTracker:
                 # if nothing answered, that's an outage, not devices ignoring the probe type
                 if len(silent) < len(targets):
                     self.dead = silent
-            # per 10 minutes and target: [rounds, lost, resent, resent quickly (by the server),
-            # RTTs in 0.5 ms bins], for the Trends view
+            # per minute and target: [rounds, lost, resent, resent quickly (by the server),
+            # RTTs in 0.5 ms bins], for the Trends views
             b = int((self.p.send_t[n] + self.tz) // TREND_S)
             for t in self.p.targets:
                 h = self.hist[t.name].get(b)
@@ -1528,8 +1529,9 @@ def loss_by_time(losses, start, end, interval, timers, size):
 
 
 def bucket_size(start, end, width):
-    """Seconds per chart column: 10 min, coarser if that many columns don't fit `width`."""
-    for size in (600, 1200, 1800, 3600):
+    """Seconds per chart column: 1 min on runs under an hour, else 10 min, coarser if that
+    many columns don't fit `width`."""
+    for size in ((60,) if end - start < 3600 else ()) + (600, 1200, 1800, 3600):
         if (end - start) / size + 2 <= width - 9:
             return size
     return 3600
@@ -1558,7 +1560,9 @@ def bar_chart(cols, start, use_color, height, axis, bottom, top, top_bg):
         rows.append(color("       └" + "─" * len(cols), GREY, use_color))
     # clock times under the columns that start a full hour, and the start if there's room
     marks, free = [" "] * (len(cols) + 8), 0
-    hours = [i for i, c in enumerate(cols) if c[0] >= start and time.localtime(c[0]).tm_min == 0]
+    # labels on the full hours; with 1-minute columns every 10 minutes
+    every = 10 if len(cols) > 1 and cols[1][0] - cols[0][0] < 600 else 60
+    hours = [i for i, c in enumerate(cols) if c[0] >= start and time.localtime(c[0]).tm_min % every == 0]
     if not hours or hours[0] >= 6:
         hours.insert(0, 0)
     for i in hours:
@@ -1786,7 +1790,7 @@ def comparisons(prober, tracker):
     return out
 
 
-TREND_S = 600      # seconds per trend bucket
+TREND_S = 60       # seconds per trend bucket: merged into 10-minute slots on runs of an hour+
 
 
 def trends(prober, tracker, link_samples=()):
@@ -1872,9 +1876,6 @@ def trends(prober, tracker, link_samples=()):
             lambda v: max(0.0, sum(x[1] for x in v) * 8 / 1000 / max(1, sum(x[2] for x in v)) - own))
         groups.append(("Your own traffic (without the probes')", "kbit/s",
                        [("down", rate(1)), ("up", rate(2))]))
-    if link_samples:
-        groups.append(("Wi-Fi", "dBm", [("signal", per_bucket(
-            [(x["t"], x["rssi"]) for x in link_samples], lambda v: statistics.median(x[1] for x in v)))]))
     changes = [(w,) for t in prober.targets for w, _ in t.ttl_changes]
     if not getattr(prober, "replay", False):
         groups.append(("Routes", "", [("TTL changes", {**{b: (0, None, None) for b in keys},
@@ -1887,29 +1888,85 @@ def trends(prober, tracker, link_samples=()):
     for title, unit, rows in groups:
         rows = [(label, vals) for label, vals in rows if vals]
         if rows:        # a topic without any data yet is left out
-            out.append((title, unit, rows, "loss" if title.startswith(loss) else "tests"))
+            out.append((title, unit, rows, "loss" if title.startswith(loss) else
+                        "raw" if title in ("Routes", "Measurement") else "tests"))
     return out
 
 
-SERIES_COLORS = ("36", "35", "34", "32", "33", "37")   # the series of a trend chart
-SERIES_GLYPHS = ("█", "▓", "▒", "░", "#", "+")          # the same without colors (report)
+# the series of a trend chart: after the Okabe–Ito palette (tellable apart with color
+# blindness too), in the stronger variants that read on light and dark backgrounds, bold so
+# the thin lines show: blue, vermillion, green, pink, orange, teal
+SERIES_COLORS = ("1;38;5;26", "1;38;5;166", "1;38;5;35", "1;38;5;169", "1;38;5;172", "1;38;5;31")
+# Lines drawn like graf (github.com/baioc/graf): every cell gets arms to its edges (left,
+# up, right, down) and shows the box-drawing character for the arms set, with rounded
+# corners. Arms of several lines in one cell add up (┼, ├, ...).
+LEFT, UP, RIGHT, DOWN = 1, 2, 4, 8
+LINE_GLYPHS = " ─│╯──╰┴│╮│┤╭┬├┼"      # indexed by the arms set (LEFT | UP | RIGHT | DOWN)
 
 
-def trend_lines(prober, tracker, cols, use_color, link_samples=(), part=None):
+def line_chart(series, width, height, lo, hi, use_color, colors=SERIES_COLORS):
+    """Lines through the points of each series (lists of values or None, one per time slot),
+    in `width` × `height` characters. The slots share the width (some get a column more
+    than others), the line steps at a slot's start and runs flat (─) in between; a value
+    is rounded to a row. Where
+    lines meet, the arms add up and the cell keeps the color of the line drawn last: draw
+    the most important one last. Returns the rows, top first."""
+    slots = max(len(v) for v in series)
+    cols = max(width, slots)
+    slot_of = [c * slots // cols for c in range(cols)]
+    arms = [[0] * cols for _ in range(height)]
+    owner = [[None] * cols for _ in range(height)]
+    row = lambda v: round((v - lo) / ((hi - lo) or 1) * (height - 1))
+    for si, vals in enumerate(series):
+        prev = None
+        for c in range(cols):
+            v = vals[slot_of[c]] if slot_of[c] < len(vals) else None
+            if v is None:          # a gap breaks the line
+                prev = None
+                continue
+            h = row(v)
+            if prev is None:       # the line starts here
+                arms[h][c] |= RIGHT | (LEFT if c else 0)
+                owner[h][c] = si
+                prev = h
+                continue
+            low, high = min(prev, h), max(prev, h)
+            for r in range(low, high + 1):
+                a = (RIGHT if r == h else 0) | (LEFT if r == prev else 0)
+                a |= (UP if r < high else 0) | (DOWN if r > low else 0)
+                arms[r][c] |= a
+                owner[r][c] = si
+            prev = h
+    out = []
+    for r in range(height - 1, -1, -1):
+        line = ""
+        for c in range(cols):
+            g = LINE_GLYPHS[arms[r][c]]
+            line += color(g, colors[owner[r][c] % len(colors)], use_color) if arms[r][c] else " "
+        out.append(line)
+    return out
+
+
+def trend_lines(prober, tracker, cols, use_color, link_samples=(), part=None, sel=None):
     """The Trends views / report section: per group one chart over the run in the style of
     the loss-over-time chart, its series as grouped bars (one column each per time slot,
     same scale), and below it per series the first and the last hour, the lowest and the
     highest hour, and whether start and end differ. Two groups side by side if they fit.
-    `part`: only the "loss" or the "tests" groups."""
+    `part`: only the "loss", "tests" or "raw" groups. `sel`: the line to highlight (counted
+    over all lines shown, in order): drawn on top in its color, the other lines grey.
+    Returns the lines; the number of lines shown is in trend_lines.count."""
     groups = [g[:3] for g in trends(prober, tracker, link_samples) if part in (None, g[3])]
+    trend_lines.count = 0
     if not groups:
         return []
     keys = sorted({b for _, _, rows in groups for _, vals in rows for b in vals})
     hours = {}
     for b in keys:
         hours.setdefault(b * TREND_S // 3600, []).append(b)
-    span = min(len(keys), 6)       # start / end: the first and the last hour (or less)
+    # start / end: the first and the last hour, or quarter of a shorter run
+    span = 60 if len(keys) >= 120 else max(1, len(keys) // 4)
     first, last = keys[:span], keys[-span:]
+    short = len(keys) < 8          # too short to compare a start with an end
 
     def agg(vals, bs):
         """Value of a set of buckets: counts summed if there are any, else the mean."""
@@ -1924,81 +1981,98 @@ def trend_lines(prober, tracker, cols, use_color, link_samples=(), part=None):
     # two charts side by side if each still gets a useful width
     bw = (cols - 4) // 2 if (cols - 4) // 2 >= 90 else cols - 1
     blocks = []
+    seen = 0           # lines before this group, for `sel`
     for title, unit, rows in groups:
         n = len(rows)
         fmt = lambda v: ("-" if v is None else f"{v:.2f}" if unit == "%" else
                          f"{v:.1f}" if unit == "ms" else f"{v:.0f}")
-        # time slots: 10 min, or merged until every slot's bars fit (n bars + a gap each)
-        k = next((k for k in (1, 2, 3, 6, 12, 18, 24, 36, 72) if (len(keys) // k + 2) * (n + 1)
-                  <= bw - 9), 144)
-        # slots on the clock (10 / 20 / 30 min, whole hours), so hours start a slot
+        # highest mean first: the order of the legend and the colors
+        rows = sorted(rows, key=lambda r: -(agg(r[1], keys)[0] or 0))
+        # time slots of 10 min, merged until there are at most two per character (braille
+        # has two dot columns), on the clock so hours start a slot
+        cw = bw - 9
+        # minutes per slot: 1 on runs under an hour, at least 10 after that; one column each
+        k = next((k for k in (1, 2, 5, 10, 20, 30, 60, 120, 180, 360)
+                  if (k >= 10 or len(keys) < 60) and len(keys) // k + 2 <= cw), 720)
         slots = [list(g) for _, g in itertools.groupby(keys, key=lambda b: b // k)]
         vals = [[agg(v, sl)[0] for sl in slots] for _, v in rows]
         flat = [v for row in vals for v in row if v is not None] or [0]
-        lo, hi = (min(flat), max(flat)) if unit == "dBm" else (0, max(flat) or 1e-9)
-        height = 5 if n > 1 else 3      # a single series needs less room
-        chart = []
-        for r in range(height - 1, -1, -1):
-            line = ""
-            for si in range(len(slots)):
-                for ri in range(n):
-                    v = vals[ri][si]
-                    lvl = 0 if v is None else max(1 if v > lo or unit == "dBm" else 0,
-                                                  round((v - lo) / ((hi - lo) or 1) * height * 8))
-                    fill = min(8, max(0, lvl - 8 * r))
-                    if not fill:
-                        line += " "
-                    elif use_color:
-                        line += color(SPARK[fill], SERIES_COLORS[ri % 6], True)
-                    else:      # no colors: a shade per series, cells at least half full
-                        line += SERIES_GLYPHS[ri % 6] if fill >= 4 else " "
-                line += " "
-            top = f"{fmt(hi)}{unit if unit == '%' else ''}"
-            label = f"{top:>6} ┤" if r == height - 1 else (f"{fmt(lo):>6} ┤" if r == 0 and unit == "dBm"
-                                                            else "       │")
-            chart.append(color(label, GREY, use_color) + line)
-        marks, free = [" "] * (len(slots) * (n + 1) + 8), 0
+        if unit in ("dBm", "ms"):
+            # around the values, not from 0 (or every latency line lies flat at the top),
+            # but at least ±5 %, so a little noise doesn't look dramatic
+            lo, hi = min(flat), max(flat)
+            pad = max(0.0, (0.1 * abs(hi) - (hi - lo)) / 2)
+            lo, hi = lo - pad, hi + pad
+        else:
+            lo, hi = 0, max(flat) or 1e-9
+        height = 12 if n > 1 else 6     # room to keep lines apart; a single one needs less
+        width = max(cw, len(slots))      # the chart uses the whole width
+        top = f"{fmt(hi)}{unit if unit == '%' else ''}"
+        bottom = f"{fmt(lo)}{unit if unit == '%' else ''}"
+        mid = f"{fmt((hi + lo) / 2)}{unit if unit == '%' else ''}"
+
+        def framed(plot):
+            """The y axis: top, middle and bottom value."""
+            h = len(plot)
+            return [color(f"{top:>6} ┤" if r == 0 else f"{bottom:>6} ┤" if r == h - 1 else
+                          f"{mid:>6} ┤" if r == h // 2 and h >= 5 else "       │", GREY, use_color) + p
+                    for r, p in enumerate(plot)]
+        # the most important line (highest mean, first in the legend) is drawn last, on top;
+        # a highlighted line instead, with the others grey
+        mine = sel - seen if sel is not None and seen <= sel < seen + n else None
+        order = list(range(n))[::-1]
+        if mine is not None:
+            order = [i for i in order if i != mine] + [mine]
+        if use_color or n == 1:
+            colors = [(SERIES_COLORS[i % 6] if i == mine else GREY) if mine is not None
+                      else SERIES_COLORS[i % 6] for i in order]
+            chart = framed(line_chart([vals[i] for i in order], width, height, lo, hi, use_color, colors))
+        else:      # no colors to tell lines apart: one small chart per series
+            chart = []
+            for ri, (label, _) in enumerate(rows):
+                chart += [f"  {label}"] + framed(line_chart([vals[ri]], width, 6, lo, hi, False))
+        # clock times under the slots that start an hour (and the first one)
+        col = lambda si: -(-si * width // len(slots))      # first column of slot si
+        marks, free = [" "] * (width + 8), 0
+        every = 600 if k < 10 else 3600     # label 10-minute marks when slots are minutes
         for si, sl in enumerate(slots):
-            hour = next((b for b in sl if b * TREND_S % 3600 == 0), None)
-            if si * (n + 1) >= free and (si == 0 or hour is not None):
+            hour = next((b for b in sl if b * TREND_S % every == 0), None)
+            if col(si) >= free and (si == 0 or hour is not None):
                 lt = time.gmtime((hour if hour is not None else sl[0]) * TREND_S)  # local, see tz
-                marks[8 + si * (n + 1):8 + si * (n + 1) + 5] = time.strftime("%H:%M", lt)
-                free = si * (n + 1) + 6
+                marks[8 + col(si):8 + col(si) + 5] = time.strftime("%H:%M", lt)
+                free = col(si) + 6
         chart.append(color("".join(marks).rstrip(), GREY, use_color))
-        # the series: legend and numbers
-        lw = min(max(len(label) for label, _ in rows) + 2, max(12, bw - 66))
-        table = [color(f"  {'':<{lw}}{'start':>8}{'end':>8}{'lowest':>13}{'highest':>13}  change "
-                       "start → end", GREY, use_color)]
+        # the series: legend, mean, the typical range of its 10-minute values, first / last hour
+        lw = min(max(len(label) for label, _ in rows) + 2, max(12, bw - 54))
+        table = [color(f"   {'':<{lw}}{'mean':>8}{'range (10–90 %)':>18}{'start':>9}{'end':>8}",
+                       GREY, use_color)]
         for ri, (label, v) in enumerate(rows):
-            s_, sn, sd = agg(v, first)
-            e_, en, ed = agg(v, last)
-            per_hour = [(x, hr) for hr in sorted(hours) for x in [agg(v, hours[hr])[0]] if x is not None]
-            low = min(per_hour, default=None)
-            high = max(per_hour, default=None)
-            at = lambda x: f"{fmt(x[0])} {time.strftime('%H:00', time.gmtime(x[1] * 3600))}" if x else "-"
-            if len(keys) < 2 * span or s_ is None or e_ is None:
-                change = "-"
-            elif sd is not None:
-                change = (("↑ " if e_ > s_ else "↓ ") + (f"{e_ / s_:.1f}×" if s_ else "from 0")
-                          if differs(sn, sd, en, ed) else "no clear change")
-            else:
-                change = (("↑ " if e_ > s_ else "↓ ") + f"{e_ / s_:.1f}×" if s_ and abs(e_ / s_ - 1) > 0.2
-                          else "about the same")
-            key = (color("█", SERIES_COLORS[ri % 6], True) if use_color else SERIES_GLYPHS[ri % 6])
-            table.append(f"{key} {label[:lw]:<{lw}}{fmt(s_):>8}{fmt(e_):>8}{at(low):>13}{at(high):>13}  "
-                         + color(change, "1" if change.startswith(("↑", "↓")) else GREY, use_color))
-        head = color(title, "1", use_color) + (color(f" · {unit}", GREY, use_color) if unit else "")
+            mean = agg(v, keys)[0]
+            spread = sorted(x for x in vals[ri] if x is not None)    # the chart's time slots
+            rng = (f"{fmt(spread[len(spread) // 10])} – {fmt(spread[(len(spread) - 1) * 9 // 10])}"
+                   if len(spread) >= 3 else "-")
+            first_v = agg(v, first)[0] if not short else None
+            last_v = agg(v, last)[0] if not short else None
+            key = color("──", SERIES_COLORS[ri % 6], True) if use_color else "  "
+            row = f"{label[:lw]:<{lw}}{fmt(mean):>8}{rng:>18}{fmt(first_v):>9}{fmt(last_v):>8}"
+            table.append(f"{key} " + (color(row, "1", use_color) + color(" ◀", "1", use_color)
+                                      if ri == mine else row))
+        seen += n
+        head = color(title, "1", use_color) + color((f" · {unit}" if unit else "")
+                                                    + f" · range: the middle 80 % of the {k}-min values",
+                                                    GREY, use_color)
         blocks.append([head] + chart + table)
 
+    trend_lines.count = seen
     out = []
     if bw < cols - 1:          # two per row
         for a, b in itertools.zip_longest(blocks[0::2], blocks[1::2], fillvalue=[]):
-            out += [""] + [x + " " * (bw + 3 - vis_len(x)) + y
-                           for x, y in itertools.zip_longest(a, b, fillvalue="")]
+            out += ["", ""] + [x + " " * (bw + 3 - vis_len(x)) + y
+                               for x, y in itertools.zip_longest(a, b, fillvalue="")]
     else:
         for b in blocks:
-            out += [""] + b
-    return out[1:]
+            out += ["", ""] + b
+    return out[2:]
 
 
 def clock(t, decimals=1):
@@ -2055,11 +2129,19 @@ def read_keys(tracker, stop):
     keys = {b"\x1b[A": 1, b"k": 1, b"\x1b[B": -1, b"j": -1, b"\x1b[5~": "pg", b"\x1b[6~": "-pg",
             b"\x1b[H": "home", b"\x1b[1~": "home", b"g": "home",
             b"\x1b[F": "end", b"\x1b[4~": "end", b"G": "end", b"h": "help", b"?": "help",
-            b"1": "v0", b"2": "v1", b"3": "v2", b"4": "v3", b"5": "v4", b"6": "v5", b"\t": "tab", b"\x1b[C": "tab", b"\x1b[D": "back"}
+            b"1": "v0", b"2": "v1", b"3": "v2", b"4": "v3", b"5": "v4", b"6": "v5", b"\t": "tab",
+            b"\x1b[C": "tab", b"\x1b[D": "back", b"\x1b": "esc"}
     while not stop.is_set():
         if not select.select([fd], [], [], 0.2)[0]:
             continue
         k = keys.get(os.read(fd, 16))
+        if tracker.view in (3, 4) and k in (1, -1, "esc"):
+            # the trend tabs: ↑/↓ walk through the lines (highlighting one), Esc: none
+            n = max(1, getattr(tracker, "trend_count", 1))
+            sel = tracker.trend_sel
+            tracker.trend_sel = (None if k == "esc" else (0 if k == -1 else n - 1) if sel is None
+                                 else (sel - k) % n)
+            continue
         if k == "pg":
             k = tracker.page
         elif k == "-pg":
@@ -2068,10 +2150,11 @@ def read_keys(tracker, stop):
             tracker.show_help = not tracker.show_help
         elif k in ("v0", "v1", "v2", "v3", "v4", "v5"):
             tracker.view = int(k[1])
+            tracker.trend_sel = None
         elif k == "tab":
-            tracker.view = (tracker.view + 1) % len(VIEWS)
+            tracker.view, tracker.trend_sel = (tracker.view + 1) % len(VIEWS), None
         elif k == "back":
-            tracker.view = (tracker.view - 1) % len(VIEWS)
+            tracker.view, tracker.trend_sel = (tracker.view - 1) % len(VIEWS), None
         elif k == "home":
             tracker.scroll = len(tracker.events)
         elif k == "end":
@@ -2295,12 +2378,16 @@ def render(prober, tracker, link_desc, wifi_now, started, use_color):
     elif tracker.view in (3, 4):
         part = "loss" if tracker.view == 3 else "tests"
         cache = getattr(tracker, "_trends", None)
-        if not cache or time.time() - cache[0] >= 10 or cache[1:3] != (cols, part):
-            cache = tracker._trends = (time.time(), cols, part, trend_lines(
-                prober, tracker, cols, use_color, wifi_now, part))
-        lines.append(headline("Trends: what changed over the run, and what didn't" if part == "loss"
-                              else "Test trends: how the tests changed over the run", cols, use_color))
-        lines += cache[3] or ["  (after the first probe rounds)"]
+        if not cache or time.time() - cache[0] >= 10 or cache[1:4] != (cols, part, tracker.trend_sel):
+            cache = tracker._trends = (time.time(), cols, part, tracker.trend_sel, trend_lines(
+                prober, tracker, cols, use_color, wifi_now, part, tracker.trend_sel))
+            tracker.trend_count = getattr(trend_lines, "count", 0)
+        hint = ("↑/↓ highlight a line · Esc: all" if tracker.trend_sel is not None
+                else "↑/↓ highlight a line")
+        lines.append(headline(("Trends: what changed over the run, and what didn't" if part == "loss"
+                               else "Test trends: how the tests changed over the run") + f" · {hint}",
+                              cols, use_color))
+        lines += cache[4] or ["  (after the first probe rounds)"]
     else:
         verdicts = dict(cached_comparisons(prober, tracker))
         lines.append(headline("Routes and markings of the replies", cols, use_color))
@@ -2336,6 +2423,9 @@ def render(prober, tracker, link_desc, wifi_now, started, use_color):
         if prober.status_runs:
             lines.append(f"  --status-cmd ran {prober.status_runs}× (status.txt)")
         lines.append(f"  everything is logged to {tracker.out_dir}/ during the run")
+        routes = trend_lines(prober, tracker, cols, use_color, part="raw")
+        if routes:
+            lines += [""] + routes
     # exactly the screen: one line less would leave the old frame's last line, one more scrolls
     lines = lines[:term_rows]
     sys.stdout.write("\x1b[H" + "\x1b[K\r\n".join(fit(l, cols - 1) for l in lines) + "\x1b[K\x1b[J")
@@ -2589,13 +2679,24 @@ def cmd_run(args):
             if prober.slept:
                 break
     except KeyboardInterrupt:
-        pass
+        if tty:     # right away: the dashboard makes way for what happens now
+            sys.stdout.write("\x1b[H\x1b[2J\r\n  " + color("netdiag", "1", True)
+                             + "  stopping, then writing the report…\x1b[K")
+            sys.stdout.flush()
     finally:
         if term:
             termios.tcsetattr(sys.stdin, termios.TCSADRAIN, term)
         su.leave()
     if tty:     # the startup steps, for the scrollback (the screen showing them is gone)
         print("netdiag\n" + "\n".join(su.text()) + "\n")
+    el = time.time() - started
+    took = (f"{el:.0f} s" if el < 60 else f"{el / 60:.0f} min" if el < 3600 else
+            f"{int(el // 3600)} h {int(el % 3600 // 60)} min")
+    print(f"Stopped after {took}. Analyzing {tracker.done:,} probe rounds and writing the report "
+          "(a few seconds, up to a minute after a long run)…\n".replace(",", " ", 1)
+          if tracker.done >= 1000 else
+          f"Stopped after {took}. Analyzing {tracker.done} probe rounds and writing the report…\n",
+          flush=True)
     prober.stop.set()
     if _POOL:
         for proc in list(_POOL._processes.values()):    # don't wait for a running scan
