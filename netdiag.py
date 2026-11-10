@@ -60,6 +60,8 @@ IPV6_HOPLIMIT, IPV6_TCLASS = getattr(socket, "IPV6_HOPLIMIT", 47), getattr(socke
 
 # Path order of targets. Traced hop N gets rank RANK_HOP + N.
 RANK_ROUTER, RANK_ONT, RANK_HOP, RANK_DEST = 0, 1, 10, 100
+# the format of a run's folder; `view` and `report` read runs of this version only
+RUN_VERSION = 2
 # A TCP probe answered only after a resend (by the server or by macOS): a packet was lost,
 # but TCP recovered it. Stored in Target.rtt next to float (answered) and None (lost).
 RESENT = "resent"
@@ -1766,13 +1768,10 @@ def comparisons(prober, tracker):
                     f"(> 1 Mbit/s, {busy_s / 60:.0f} min) {part(busy_l, busy_s)}"))
 
     changes = [(t, w) for t in prober.targets for w, _ in t.ttl_changes]
-    if getattr(prober, "replay", False):
-        changes = None
-    routes = changes is not None and f"{len(changes)} TTL changes" + (
+    routes = f"{len(changes)} TTL changes" + (
         f" (last: {max(changes, key=lambda c: c[1])[0].name} at {clock(max(c[1] for c in changes))})"
         if changes else "") + " (the reply's TTL counts the routers on the way: a change = a new route)"
-    if changes is not None:
-        out.append(("Routes", routes))
+    out.append(("Routes", routes))
     order = ["Direction", "Packet size", "Priority marking", "IPv4 vs IPv6"]
     out.sort(key=lambda o: order.index(o[0]) if o[0] in order else len(order))
     if prober.clock_checks:
@@ -1828,13 +1827,9 @@ def trends(prober, tracker, link_samples=()):
     tcp = [t for t in prober.targets if t.port and not t.extra and t.rank == RANK_DEST]
     if tcp:
         tot = lambda i: (lambda b: sum(h(t, b, i) for t in tcp))
-        if getattr(prober, "resent_known", True):
-            groups.append(("TCP to the destinations", "%", [
-                ("resent (TCP recovered it)", share(tot(2), tot(0))),
-                ("lost (even after a resend)", share(tot(1), tot(0)))]))
-        else:       # a run from before resends were told apart
-            groups.append(("TCP to the destinations", "%", [
-                ("lost or resent", share(lambda b: tot(1)(b) + tot(2)(b), tot(0)))]))
+        groups.append(("TCP to the destinations", "%", [
+            ("resent (TCP recovered it)", share(tot(2), tot(0))),
+            ("lost (even after a resend)", share(tot(1), tot(0)))]))
     groups.append(("Latency, median", "ms", [(name(t), p50(t)) for t in ([hop] if hop else []) + dests]))
     quick = [t for t in tcp if sum(x[3] for x in hist[t.name].values()) >= 3]
     if quick:
@@ -1877,9 +1872,8 @@ def trends(prober, tracker, link_samples=()):
         groups.append(("Your own traffic (without the probes')", "kbit/s",
                        [("down", rate(1)), ("up", rate(2))]))
     changes = [(w,) for t in prober.targets for w, _ in t.ttl_changes]
-    if not getattr(prober, "replay", False):
-        groups.append(("Routes", "", [("TTL changes", {**{b: (0, None, None) for b in keys},
-                                                       **per_bucket(changes, len)})]))
+    groups.append(("Routes", "", [("TTL changes", {**{b: (0, None, None) for b in keys},
+                                                   **per_bucket(changes, len)})]))
     if prober.quality:
         groups.append(("Measurement", "ms", [("worst read delay", per_bucket(
             [(m + 30, b) for m, _, b, _ in prober.quality if m], lambda v: max(x[1] for x in v)))]))
@@ -2083,7 +2077,7 @@ def trend_lines(prober, tracker, cols, use_color, link_samples=(), part=None, se
     out = []
     if bw < cols - 1:          # two per row
         for a, b in itertools.zip_longest(blocks[0::2], blocks[1::2], fillvalue=[]):
-            out += ["", ""] + [x + " " * (bw + 3 - vis_len(x)) + y
+            out += ["", ""] + [fit(x, bw) + " " * max(3, bw + 3 - vis_len(x)) + y
                                for x, y in itertools.zip_longest(a, b, fillvalue="")]
     else:
         for b in blocks:
@@ -2146,11 +2140,14 @@ def read_keys(tracker, stop):
             b"\x1b[H": "home", b"\x1b[1~": "home", b"g": "home",
             b"\x1b[F": "end", b"\x1b[4~": "end", b"G": "end", b"h": "help", b"?": "help",
             b"1": "v0", b"2": "v1", b"3": "v2", b"4": "v3", b"5": "v4", b"6": "v5", b"\t": "tab",
-            b"\x1b[C": "tab", b"\x1b[D": "back", b"\x1b": "esc"}
+            b"\x1b[C": "tab", b"\x1b[D": "back", b"\x1b": "esc", b"q": "quit", b"Q": "quit"}
     while not stop.is_set():
         if not select.select([fd], [], [], 0.2)[0]:
             continue
         k = keys.get(os.read(fd, 16))
+        if k == "quit" or k == "esc" and tracker.trend_sel is None and getattr(tracker, "viewer", False):
+            tracker.quit = True        # leaves a viewer (a live run stops with Ctrl+C)
+            continue
         if tracker.view in (3, 4) and k in (1, -1, "esc"):
             # the trend tabs: ↑/↓ walk through the lines (highlighting one), Esc: none
             n = max(1, getattr(tracker, "trend_count", 1))
@@ -2320,9 +2317,15 @@ def render(prober, tracker, link_desc, wifi_now, started, use_color):
     targets = prober.targets
     el = time.time() - started
     lines = []
-    top = (color("netdiag", "1", use_color) +
-           f"  {link_desc}  ·  {f'{int(el // 60)}m{int(el % 60):02d}s':>7}  ·  "
-           f"{done:>7} rounds @ {prober.interval * 1000:.0f} ms  ·  Ctrl+C stops")
+    if getattr(prober, "replay", False):    # a saved run: when it was, how long, how to leave
+        top = (color("netdiag", "1", use_color) + f"  {link_desc}  ·  "
+               + color(time.strftime("%a %d.%m. %H:%M", time.localtime(prober.send_t[0])), "1", use_color)
+               + f"  ·  {fmt_span(prober.send_t[-1] - prober.send_t[0])}  ·  {done} rounds @ "
+               f"{prober.interval * 1000:.0f} ms  ·  q back")
+    else:
+        top = (color("netdiag", "1", use_color) +
+               f"  {link_desc}  ·  {f'{int(el // 60)}m{int(el % 60):02d}s':>7}  ·  "
+               f"{done:>7} rounds @ {prober.interval * 1000:.0f} ms  ·  Ctrl+C stops")
     wifi = ""
     if wifi_now:       # Wi-Fi link state, right-aligned on the same line
         w = wifi_now[-1]
@@ -2613,6 +2616,11 @@ def cmd_run(args):
     clock_start = (time.time(), *c) if c else None
     su.done(f"{c[0] * 1000:+.0f} ms off time.apple.com" if c else "time.apple.com not reachable",
             "✓" if c else "⚠")
+    setup = "direct" if direct else "router+ont" if ont else "router"
+    write_run_json(out_dir, targets, {
+        "start": time.time(), "argv": sys.argv[1:], "interval": args.interval, "link": link,
+        "link_label": link_label, "iface": iface, "setup": setup,
+        "clock": [clock_start] if clock_start else []})
     su.step("Starting the probes")
 
     full, link_samples, sampler = None, [], None
@@ -2739,7 +2747,6 @@ def cmd_run(args):
         else:
             full = {"awdl_up": awdl_up(), "scan_skipped": router.name if router else "router"}
     check_clock()       # again at the end: did the Mac's clock stay right?
-    setup = "direct" if direct else "router+ont" if ont else "router"
     report(prober, tracker, link, iface, full, link_samples, counters_before, out_dir, err_samples,
            setup)
 
@@ -2786,69 +2793,66 @@ def save_probes(prober, upto, out_dir):
     prober.saved = max(start, upto)
 
 
-MARK_TOS = {m: tos for m, tos, _ in MARKINGS}
+TARGET_FIELDS = ("name", "addr", "rank", "hop", "port", "size", "tos", "v6", "extra", "label")
 
 
-def target_from(name, row=None):
-    """A Target for a saved run, from its summary.json row, or guessed from its name (a run
-    that ended before writing one)."""
-    probe = (row or {}).get("probe", "")
-    m = re.fullmatch(r"(.+):(\d+)", name) if not name.startswith("v6-") else None
-    port = int(m.group(2)) if m else (int(probe[4:].split(",")[0]) if probe.startswith("tcp:") else None)
-    base = m.group(1) if m else name.split("·")[0]
-    size = re.search(r"(\d+) ?B(?:ytes)?$", name.split("·")[-1]) if "·" in name else None
-    mark = name.split("·")[-1] if "·" in name else None
-    hop = re.match(r"hop(\d+)", base)
-    rank = (row or {}).get("rank", RANK_ROUTER if base in ("home-router", "ont") else
-                           RANK_HOP + int(hop.group(1)) if hop else
-                           RANK_HOP + 2 if base == "v6-isp" else RANK_HOP if base == "isp-gw" else RANK_DEST)
-    v6 = name.startswith("v6-")
-    addr = (row or {}).get("addr") or (base if re.fullmatch(r"[\d.]+", base) else
-                                     {f"v6-{v.lower()}": k for k, v in V6_HOSTS.items()}.get(name, base))
-    return Target(name, addr, rank, (row or {}).get("hop"), port=port,
-                  size=int(size.group(1)) if size else None, tos=MARK_TOS.get(mark, 0), v6=v6,
-                  extra=(row or {}).get("extra", "·" in name or v6),
-                  label=f"IPv6 {V6_HOSTS[addr]}" if v6 and addr in V6_HOSTS else None)
+def write_run_json(out_dir, targets, info):
+    """run.json, written at the start: what the run is, so it can be read back (`view`,
+    `report`) even if it never got to write its report."""
+    with open(os.path.join(out_dir, "run.json"), "w") as f:
+        json.dump({"version": RUN_VERSION, **info,
+                   "targets": [{k: getattr(t, k) for k in TARGET_FIELDS} for t in targets]}, f, indent=1)
+
+
+def read_run_json(folder):
+    """A run's run.json, or None if it's missing or from another version."""
+    try:
+        run = json.load(open(os.path.join(folder, "run.json")))
+    except (OSError, ValueError):
+        return None
+    return run if run.get("version") == RUN_VERSION else None
 
 
 class Replay:
-    """A finished run read back from its folder, standing in for the Prober, so `report`
-    can analyze it again with the current version."""
+    """A saved run read back from its folder, standing in for the Prober, so `view` and
+    `report` show it with the current version."""
     replay = True
     timeout, tcp_timeout, keep, status_runs = 1.0, 1.9, None, 0
 
     def __init__(self, folder):
+        run = read_run_json(folder)
+        if not run:
+            sys.exit(f"{folder}: not a run of this version of netdiag (no run.json version "
+                     f"{RUN_VERSION}), it can't be read")
+        self.run = run
         path = os.path.join(folder, "summary.json")
         self.summary = json.load(open(path)) if os.path.exists(path) else {}
-        rows = {r["name"]: r for r in self.summary.get("targets", [])}
-        # runs from before TCP resends were told apart from losses don't know them
-        self.resent_known = any(r.get("resent") is not None for r in rows.values())
+        self.targets = [Target(**{k: d[k] for k in TARGET_FIELDS}) for d in run["targets"]]
+        by = {t.name: t for t in self.targets}
         with open(os.path.join(folder, "probes.csv")) as f:
             r = csv.reader(f)
-            names = next(r)[2:]
-            self.targets = [target_from(n, rows.get(n)) for n in names]
+            cols = [by[n] for n in next(r)[2:]]
             self.send_t = []
             for row in r:
+                if len(row) != len(cols) + 2:      # cut off by a crash
+                    break
                 n = len(self.send_t)
                 self.send_t.append(float(row[1]))
-                for t, v in zip(self.targets, row[2:]):
+                for t, v in zip(cols, row[2:]):
                     if not v:
                         t.rtt.append(None)
                     elif v.startswith(RESENT):
                         t.rtt.append(RESENT)
-                        self.resent_known = True
-                        if ":" in v and v.split(":")[1] != "0":
-                            t.resend_ms[n] = float(v.split(":")[1])
+                        t.resend_ms[n] = float(v.split(":")[1])
                     else:
                         t.rtt.append(float(v))
         if len(self.send_t) < 2:
             sys.exit(f"{folder}: not enough probe rounds to analyze")
-        self.interval = self.summary.get("interval") or round(
-            (self.send_t[-1] - self.send_t[0]) / (len(self.send_t) - 1), 3)
+        self.interval = run["interval"]
         self.slept = self.summary.get("slept")
         self.misread = [0] * self.summary.get("misread", 0)
-        self.argv = self.summary.get("argv")
-        self.clock_checks = self.summary.get("clock") or []
+        self.argv = run.get("argv")
+        self.clock_checks = self.summary.get("clock") or run.get("clock") or []
         self.traffic, self.quality = [], []
         with contextlib.suppress(OSError, ValueError):
             with open(os.path.join(folder, "traffic.csv")) as f:
@@ -2857,19 +2861,18 @@ class Replay:
         with contextlib.suppress(OSError, ValueError):
             with open(os.path.join(folder, "quality.csv")) as f:
                 next(f)
-                # minutes are saved as local HH:MM: back to times, counting days from the start
-                lt = time.localtime(self.send_t[0])
-                day = self.send_t[0] - lt.tm_hour * 3600 - lt.tm_min * 60 - lt.tm_sec
-                prev = 0
-                for line in f:
-                    if not line.strip():
-                        continue
-                    hm, a, b, c = line.strip().split(",")
-                    m = day + int(hm[:2]) * 3600 + int(hm[3:5]) * 60
-                    while m < max(prev, self.send_t[0] - 60):
-                        m += 86400
-                    self.quality.append([m, float(a), float(b), int(c)])
-                    prev = m
+                self.quality = [[float(m), float(a), float(b), int(c)] for m, a, b, c in
+                                (line.strip().split(",") for line in f if line.strip())]
+        with contextlib.suppress(OSError, ValueError):
+            for name, d in json.load(open(os.path.join(folder, "paths.json"))).items():
+                if name in by:
+                    t = by[name]
+                    t.ttl, t.ttl_changes = d["ttl"], [tuple(x) for x in d["ttl_changes"]]
+                    t.reply_tos = Counter({int(k): v for k, v in d["reply_tos"].items()})
+        self.wifi_scan, self.wifi_samples = None, []
+        with contextlib.suppress(OSError, ValueError):
+            w = json.load(open(os.path.join(folder, "wifi.json")))
+            self.wifi_scan, self.wifi_samples = w.get("scan"), w.get("samples", [])
         per_round = sum(60 if t.port else (t.size or (48 if t.v6 else 20) + 8 + 25)
                         for t in self.targets)
         self.probe_kbps = per_round * 8 / 1000 / self.interval
@@ -2878,31 +2881,187 @@ class Replay:
         return len(self.send_t)
 
 
+BASE_TEXTS = [(d, dict(d)) for d in (SEGMENT_TEXT, SEGMENT_SHORT, ADVICE)]
+
+
+def apply_setup(setup):
+    """The texts for how this Mac was connected (router / ONT directly / router + ONT)."""
+    for d, base in BASE_TEXTS:
+        d.clear()
+        d.update(base)
+    extra = {"direct": (DIRECT_ONT_TEXT, DIRECT_ONT_SHORT, DIRECT_ONT_ADVICE),
+             "router+ont": (SEPARATE_ONT_TEXT, SEPARATE_ONT_SHORT, SEPARATE_ONT_ADVICE)}.get(setup)
+    for (d, _), more in zip(BASE_TEXTS, extra or ()):
+        d.update(more)
+
+
+def fmt_span(sec):
+    return (f"{sec:.0f} s" if sec < 60 else f"{sec / 60:.0f} min" if sec < 3600 else
+            f"{int(sec // 3600)} h {int(sec % 3600 // 60):02d} min")
+
+
+def view_run(folder):
+    """Show a saved run in the dashboard (on the alternate screen, keys in cbreak mode,
+    both set up by the caller) until q. Returns False if it can't be read."""
+    if not read_run_json(folder):
+        return False
+    sys.stdout.write("\x1b[H\x1b[2J\r\n  " + color("netdiag", "1", True)
+                     + f"  reading {os.path.basename(folder)}…\x1b[K")
+    sys.stdout.flush()
+    rp = Replay(folder)
+    apply_setup(rp.run["setup"])
+    tracker = EventTracker(rp, rp.run["link_label"])
+    tracker.out_dir, tracker.viewer, tracker.quit = folder, True, False
+    tracker.update()
+    stop = threading.Event()
+    keys = threading.Thread(target=read_keys, args=(tracker, stop), daemon=True)
+    keys.start()
+    desc = f"{rp.run['link_label']} {rp.run['iface']}"
+    try:
+        while not tracker.quit:
+            render(rp, tracker, desc, rp.wifi_samples, rp.send_t[0], True)
+            time.sleep(0.1)
+    except KeyboardInterrupt:
+        pass
+    stop.set()
+    keys.join()
+    return True
+
+
+def fullscreen(fn, *a):
+    """Run fn on the alternate screen with keys read one by one (cbreak), and restore both."""
+    term = termios.tcgetattr(sys.stdin)
+    sys.stdout.write("\x1b[?1049h\x1b[?25l")
+    try:
+        ttymode.setcbreak(sys.stdin)
+        return fn(*a)
+    finally:
+        termios.tcsetattr(sys.stdin, termios.TCSADRAIN, term)
+        sys.stdout.write("\x1b[?25h\x1b[?1049l")
+        sys.stdout.flush()
+
+
+def cmd_view(args):
+    """Show a saved run in the dashboard, like a live run."""
+    if not sys.stdout.isatty() or not sys.stdin.isatty():
+        sys.exit("view needs a terminal")
+    if not fullscreen(view_run, args.dir):
+        sys.exit(f"{args.dir}: not a run of this version of netdiag")
+
+
+USAGE = """\
+Find where packet loss and latency spikes on your connection come from: probes your
+router, the ISP's routers and four internet destinations at the same moment.
+
+  ./netdiag.py run              start a test (Ctrl+C stops it and writes the report)
+  ./netdiag.py run -d 3600      … for one hour         -i 0.2   probe every 200 ms
+  ./netdiag.py run --ont IP     with a separate ONT/modem in front of the router
+  ./netdiag.py view DIR         look at a saved run in the same screens
+  ./netdiag.py report DIR       write a saved run's report again
+  ./netdiag.py summarize        compare all saved runs in one table
+  ./netdiag.py run -h           all options"""
+
+
+def run_rows(out):
+    """The saved runs of this version, newest first: (folder, start, seconds, run, summary)."""
+    rows = []
+    for folder in sorted(glob.glob(os.path.join(out, "2*")), reverse=True):
+        run = read_run_json(folder)
+        if not run:
+            continue
+        path = os.path.join(folder, "summary.json")
+        summary = json.load(open(path)) if os.path.exists(path) else None
+        if summary:
+            span = summary["end"] - summary["start"]
+        else:          # stopped without a report (a crash, the Mac's battery): the last round
+            span = 0
+            with contextlib.suppress(OSError, ValueError, IndexError):
+                with open(os.path.join(folder, "probes.csv"), "rb") as f:
+                    f.seek(max(0, os.path.getsize(f.name) - 4096))
+                    span = float(f.read().decode(errors="replace").strip().splitlines()[-1].split(",")[1]) - run["start"]
+        rows.append((folder, run["start"], span, run, summary))
+    return rows
+
+
+def home_lines(rows, sel, cols, term_rows):
+    """The start screen: how to use it, and the saved runs to pick from."""
+    out = ["", color("  netdiag", "1", True)]
+    out += ["  " + l for l in USAGE.splitlines()] + [""]
+    if not rows:
+        return out + [color("  No saved runs yet: start one with n (or ./netdiag.py run).", GREY, True)]
+    out.append(color("  Saved runs", "1", True) + color("   ↑/↓ choose · Enter view · n new run · q quit",
+                                                        GREY, True))
+    out.append(color(f"    {'started':<20}{'length':>12}   {'connection':<26}{'probes':>8}   "
+                     f"{'ISP-side loss':>14}   status", GREY, True))
+    room = max(3, term_rows - len(out) - 1)
+    top = min(max(0, sel - room // 2), max(0, len(rows) - room))
+    for i, (folder, start, span, run, summary) in enumerate(rows[top:top + room], top):
+        loss = "-"
+        if summary:
+            isp = [t["loss_pct"] for t in summary["targets"]
+                   if t["rank"] > RANK_ONT and not t.get("extra") and t["probe"] == "icmp" and not t["silent"]]
+            loss = f"{statistics.median(isp):.2f}%" if isp else "-"
+        status = ("stopped by sleep" if summary and summary.get("slept") else "report written"
+                  if summary else "no report (cut off)")
+        line = (f"{time.strftime('%a %d.%m. %H:%M', time.localtime(start)):<20}{fmt_span(span):>12}   "
+                f"{run['link_label'] + ' · ' + run['setup']:<26}{run['interval'] * 1000:>6.0f} ms"
+                f"{loss:>17}   {status}")
+        out.append(color(f"  ▶ {line}", "1;7", True) if i == sel else f"    {line}")
+    return out
+
+
+def home(out_dir):
+    """The start screen; returns "run" to start a new run, None to quit."""
+    rows, sel = run_rows(out_dir), 0
+    fd = sys.stdin.fileno()
+    while True:
+        cols, term_rows = shutil.get_terminal_size((100, 30))
+        lines = home_lines(rows, sel, cols, term_rows)[:term_rows]
+        sys.stdout.write("\x1b[H" + "\x1b[K\r\n".join(fit(l, cols - 1) for l in lines) + "\x1b[K\x1b[J")
+        sys.stdout.flush()
+        if not select.select([fd], [], [], 1)[0]:
+            continue           # redraw now and then (window size, runs being written)
+        k = os.read(fd, 16)
+        if k in (b"q", b"Q", b"\x1b"):
+            return None
+        if k in (b"n", b"N"):
+            return "run"
+        if k in (b"\x1b[A", b"k") and rows:
+            sel = (sel - 1) % len(rows)
+        elif k in (b"\x1b[B", b"j") and rows:
+            sel = (sel + 1) % len(rows)
+        elif k in (b"\r", b"\n", b"\x1b[C") and rows:
+            view_run(rows[sel][0])
+            rows = run_rows(out_dir)
+            sel = min(sel, max(0, len(rows) - 1))
+
+
+def cmd_home(args):
+    """No command: how to use it, and the saved runs to look at."""
+    if not sys.stdout.isatty() or not sys.stdin.isatty():
+        print(USAGE)
+        return
+    if fullscreen(home, "netdiag-logs") == "run":
+        ap = build_parser()
+        run = ap.parse_args(["run"])
+        run.func(run)
+
+
 def cmd_report(args):
     """Analyze a saved run again, with this version of the analysis."""
     rp = Replay(args.dir)
     old, kept = os.path.join(args.dir, "report.txt"), os.path.join(args.dir, "report.before.txt")
     if os.path.exists(old) and not os.path.exists(kept):
         shutil.copy(old, kept)      # the first report stays around for comparison
-    setup = rp.summary.get("setup", "router")
-    for text, short, advice in ((DIRECT_ONT_TEXT, DIRECT_ONT_SHORT, DIRECT_ONT_ADVICE),
-                                (SEPARATE_ONT_TEXT, SEPARATE_ONT_SHORT, SEPARATE_ONT_ADVICE)):
-        if setup == ("direct" if text is DIRECT_ONT_TEXT else "router+ont"):
-            SEGMENT_TEXT.update(text)
-            SEGMENT_SHORT.update(short)
-            ADVICE.update(advice)
-    link = rp.summary.get("link") or ("wifi" if os.path.exists(os.path.join(args.dir, "wifi.json"))
-                                       else "ethernet")
-    tracker = EventTracker(rp, "Wi-Fi" if link == "wifi" else "Ethernet/LAN")
+    setup, link = rp.run["setup"], rp.run["link"]
+    apply_setup(setup)
+    tracker = EventTracker(rp, rp.run["link_label"])
     tracker.out_dir = args.dir
     print(f"Analyzing {args.dir} again ({len(rp.send_t)} probe rounds)...")
     tracker.update()
-    full, samples = None, []
-    with contextlib.suppress(OSError, ValueError):
-        w = json.load(open(os.path.join(args.dir, "wifi.json")))
-        full, samples = w.get("scan"), w.get("samples", [])
     errs = [(t, e) for t, _, _, e in rp.traffic]
-    report(rp, tracker, link, rp.summary.get("iface", "?"), full, samples, None, args.dir, errs, setup)
+    report(rp, tracker, link, rp.run["iface"], rp.wifi_scan, rp.wifi_samples, None, args.dir, errs,
+           setup)
 
 
 def save_logs(prober, out_dir):
@@ -2917,17 +3076,13 @@ def save_logs(prober, out_dir):
     prober.saved_traffic = start + len(rows)
     with open(os.path.join(out_dir, "quality.csv"), "w") as f:
         f.write("minute,worst_send_delay_ms,worst_read_delay_ms,replies_read_too_late\n")
-        f.writelines(f"{time.strftime('%H:%M', time.localtime(m))},{a:.1f},{b:.1f},{c}\n"
-                     for m, a, b, c in list(prober.quality))
-    with open(os.path.join(out_dir, "paths.txt"), "w") as f:
-        f.write("Reply TTL / hop limit changes (a changed route) and reply markings (TOS) per target\n")
-        for t in prober.targets:
-            if t.port:
-                continue
-            tos = ", ".join(f"0x{k:02x}: {v}" for k, v in t.reply_tos.most_common())
-            f.write(f"\n{t.name} ({t.addr}): TTL {t.ttl}, reply TOS {tos or '-'}\n")
-            for when, ttl in t.ttl_changes:
-                f.write(f"  {clock(when)}  TTL → {ttl}\n")
+        f.writelines(f"{m:.0f},{a:.1f},{b:.1f},{c}\n" for m, a, b, c in list(prober.quality))
+    # per ICMP target: the reply TTL (hop limit) now, when it changed (= a new route), and
+    # the reply markings (TOS byte -> count)
+    with open(os.path.join(out_dir, "paths.json"), "w") as f:
+        json.dump({t.name: {"ttl": t.ttl, "ttl_changes": t.ttl_changes,
+                            "reply_tos": {str(k): v for k, v in t.reply_tos.items()}}
+                   for t in prober.targets if not t.port}, f, indent=1)
 
 
 def _report(prober, tracker, link, iface, full, link_samples, counters_before, out_dir, err_samples,
@@ -3058,14 +3213,14 @@ def write_summaries(prober, tracker, stats, info, link, setup, out_dir):
         rows.append({"name": t.name, "addr": t.addr, "hop": t.hop, "probe": probe_label(t),
                      "rank": t.rank, "sent": r["sent"], "lost": r["lost"],
                      "loss_pct": round(r["loss_pct"], 3),
-                     "resent": r.get("resent", 0) if getattr(prober, "resent_known", True) else None,
+                     "resent": r.get("resent", 0),
                      "p50": round(r["p50"], 2) if "p50" in r else None,
                      "silent": t.name in tracker.dead, "extra": t.extra})
     summary = {"start": prober.send_t[0], "end": prober.send_t[done - 1], "rounds": done,
                "interval": prober.interval, "link": link, "setup": setup, "targets": rows,
                "verdict": info.get("verdict"), "shared": info.get("shared"),
                "periodic": info.get("periodic"), "comparisons": info.get("comparisons"),
-               "slept": prober.slept, "misread": len(prober.misread),
+               "version": RUN_VERSION, "slept": prober.slept, "misread": len(prober.misread),
                "timers": info.get("timers"), "clock": prober.clock_checks,
                "argv": getattr(prober, "argv", None) or sys.argv[1:]}
     with open(os.path.join(out_dir, "summary.json"), "w") as f:
@@ -3075,7 +3230,8 @@ def write_summaries(prober, tracker, stats, info, link, setup, out_dir):
 def cmd_summarize(args):
     """Compare several runs (e.g. different times of day) side by side."""
     paths = sorted(p for d in args.dirs for p in glob.glob(os.path.join(d, "**", "summary.json"),
-                                                           recursive=True))
+                                                           recursive=True)
+                   if read_run_json(os.path.dirname(p)))      # runs of this version only
     if not paths:
         sys.exit("No summary.json found (runs made with this version of netdiag write one).")
     head = ("| start | min | setup | probe | first device | ISP first hop | internet ICMP "
@@ -3478,9 +3634,10 @@ def cmd_analyze(args):
     print_findings(findings)
 
 
-def main():
+def build_parser():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    sub = ap.add_subparsers(dest="cmd", required=True)
+    ap.set_defaults(func=cmd_home)      # no command: the start screen
+    sub = ap.add_subparsers(dest="cmd")
     a = sub.add_parser("analyze", help="analyze saved ping output")
     a.add_argument("files", nargs="+")
     a.add_argument("-i", "--interval", type=float, default=1.0, help="ping interval used (s)")
@@ -3511,11 +3668,18 @@ def main():
     rp = sub.add_parser("report", help="analyze a saved run again with this version")
     rp.add_argument("dir", help="the run's folder, e.g. netdiag-logs/20261109-231641")
     rp.set_defaults(func=cmd_report)
+    vw = sub.add_parser("view", help="look at a saved run in the dashboard, like a live run")
+    vw.add_argument("dir", help="the run's folder, e.g. netdiag-logs/20261109-231641")
+    vw.set_defaults(func=cmd_view)
     sm = sub.add_parser("summarize", help="compare saved runs side by side")
     sm.add_argument("dirs", nargs="*", default=["netdiag-logs"])
     sm.add_argument("--out", default="netdiag-logs/summary.md", help="also save the table here")
     sm.set_defaults(func=cmd_summarize)
-    args = ap.parse_args()
+    return ap
+
+
+def main():
+    args = build_parser().parse_args()
     args.func(args)
 
 

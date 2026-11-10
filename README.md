@@ -17,6 +17,7 @@ behind it is where packets get lost.
 ```sh
 git clone https://github.com/vonox7/internet-connection-loss-debugger.git
 cd internet-connection-loss-debugger
+./netdiag.py              # start screen: how to use it, and your saved runs to look at
 ./netdiag.py run          # live dashboard; Ctrl+C stops it and prints the report
 ```
 
@@ -99,8 +100,15 @@ After Ctrl+C (or `-d SECONDS`) you get per-station statistics and findings, e.g.
 Everything is saved in `netdiag-logs/<timestamp>/` (during the run too): `report.txt`,
 `events.txt` / `events.json` (all events), `probes.csv` (every single probe),
 `traceroute.txt`, `traffic.csv` (this Mac's traffic and interface errors per
-second), `quality.csv` (the tool's own delays per minute), `paths.txt` (TTL changes and
-reply markings), `summary.json`. These files contain your IP addresses, so check them before sharing.
+second), `quality.csv` (the tool's own delays per minute), `paths.json` (TTL changes and
+reply markings), `run.json` (the setup, written at the start), `summary.json`.
+
+Look at a saved run in the same screens as a live one (also from the start screen: pick it
+and press Enter):
+
+```sh
+./netdiag.py view netdiag-logs/20261111-230000
+``` These files contain your IP addresses, so check them before sharing.
 
 Compare several runs (different times of day) with:
 
