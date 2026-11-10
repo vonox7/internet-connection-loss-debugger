@@ -1901,21 +1901,21 @@ SERIES_COLORS = ("1;38;5;26", "1;38;5;166", "1;38;5;35", "1;38;5;169", "1;38;5;1
 # up, right, down) and shows the box-drawing character for the arms set, with rounded
 # corners. Arms of several lines in one cell add up (┼, ├, ...).
 LEFT, UP, RIGHT, DOWN = 1, 2, 4, 8
-LINE_GLYPHS = " ─│╯──╰┴│╮│┤╭┬├┼"      # indexed by the arms set (LEFT | UP | RIGHT | DOWN)
+# heavy strokes, so the lines show clearly; indexed by the arms set (LEFT | UP | RIGHT | DOWN)
+LINE_GLYPHS = " ━┃┛━━┗┻┃┓┃┫┏┳┣╋"
 
 
 def line_chart(series, width, height, lo, hi, use_color, colors=SERIES_COLORS):
     """Lines through the points of each series (lists of values or None, one per time slot),
-    in `width` × `height` characters. The slots share the width (some get a column more
-    than others), the line steps at a slot's start and runs flat (─) in between; a value
-    is rounded to a row. Where
-    lines meet, the arms add up and the cell keeps the color of the line drawn last: draw
-    the most important one last. Returns the rows, top first."""
+    in `width` × `height` characters, each in its color. The slots
+    share the width (some get a column more than others), the line steps at a slot's start
+    and runs flat in between; a value is rounded to a row. Where lines share a cell, the
+    arms add up and the cells take turns column by column with the lines' colors, so lines
+    running together look striped and all stay visible. Returns the rows, top first."""
     slots = max(len(v) for v in series)
     cols = max(width, slots)
     slot_of = [c * slots // cols for c in range(cols)]
-    arms = [[0] * cols for _ in range(height)]
-    owner = [[None] * cols for _ in range(height)]
+    arms = [[{} for _ in range(cols)] for _ in range(height)]     # per cell: series -> arms
     row = lambda v: round((v - lo) / ((hi - lo) or 1) * (height - 1))
     for si, vals in enumerate(series):
         prev = None
@@ -1926,34 +1926,40 @@ def line_chart(series, width, height, lo, hi, use_color, colors=SERIES_COLORS):
                 continue
             h = row(v)
             if prev is None:       # the line starts here
-                arms[h][c] |= RIGHT | (LEFT if c else 0)
-                owner[h][c] = si
+                arms[h][c][si] = arms[h][c].get(si, 0) | RIGHT | (LEFT if c else 0)
                 prev = h
                 continue
             low, high = min(prev, h), max(prev, h)
             for r in range(low, high + 1):
                 a = (RIGHT if r == h else 0) | (LEFT if r == prev else 0)
                 a |= (UP if r < high else 0) | (DOWN if r > low else 0)
-                arms[r][c] |= a
-                owner[r][c] = si
+                arms[r][c][si] = arms[r][c].get(si, 0) | a
             prev = h
     out = []
     for r in range(height - 1, -1, -1):
         line = ""
         for c in range(cols):
-            g = LINE_GLYPHS[arms[r][c]]
-            line += color(g, colors[owner[r][c] % len(colors)], use_color) if arms[r][c] else " "
+            cell = arms[r][c]
+            if not cell:
+                line += " "
+                continue
+            union = 0
+            for a in cell.values():
+                union |= a
+            si = sorted(cell)[c % len(cell)]        # shared: the lines take turns
+            line += color(LINE_GLYPHS[union], colors[si % len(colors)], use_color)
         out.append(line)
     return out
 
 
-def trend_lines(prober, tracker, cols, use_color, link_samples=(), part=None, sel=None):
+def trend_lines(prober, tracker, cols, use_color, link_samples=(), part=None, sel=None, rows_free=None):
     """The Trends views / report section: per group one chart over the run in the style of
     the loss-over-time chart, its series as grouped bars (one column each per time slot,
     same scale), and below it per series the first and the last hour, the lowest and the
     highest hour, and whether start and end differ. Two groups side by side if they fit.
     `part`: only the "loss", "tests" or "raw" groups. `sel`: the line to highlight (counted
     over all lines shown, in order): drawn on top in its color, the other lines grey.
+    `rows_free`: the screen lines available; all charts get the same height that fills them.
     Returns the lines; the number of lines shown is in trend_lines.count."""
     groups = [g[:3] for g in trends(prober, tracker, link_samples) if part in (None, g[3])]
     trend_lines.count = 0
@@ -1980,6 +1986,15 @@ def trend_lines(prober, tracker, cols, use_color, link_samples=(), part=None, se
 
     # two charts side by side if each still gets a useful width
     bw = (cols - 4) // 2 if (cols - 4) // 2 >= 90 else cols - 1
+    # chart height: fixed, or what fills the screen. A row of charts takes, besides the
+    # charts: title, time axis, legend header and its longest legend, and 2 blank lines
+    # before the next row
+    fixed_height = None
+    if rows_free:
+        per_row = 2 if bw < cols - 1 else 1
+        pairs = [groups[i:i + per_row] for i in range(0, len(groups), per_row)]
+        other = sum(3 + max(len(g[2]) for g in pair) for pair in pairs) + 2 * (len(pairs) - 1)
+        fixed_height = max(4, (rows_free - other) // len(pairs))
     blocks = []
     seen = 0           # lines before this group, for `sel`
     for title, unit, rows in groups:
@@ -2005,7 +2020,7 @@ def trend_lines(prober, tracker, cols, use_color, link_samples=(), part=None, se
             lo, hi = lo - pad, hi + pad
         else:
             lo, hi = 0, max(flat) or 1e-9
-        height = 12 if n > 1 else 6     # room to keep lines apart; a single one needs less
+        height = fixed_height or (12 if n > 1 else 6)   # a single line needs less room
         width = max(cw, len(slots))      # the chart uses the whole width
         top = f"{fmt(hi)}{unit if unit == '%' else ''}"
         bottom = f"{fmt(lo)}{unit if unit == '%' else ''}"
@@ -2026,7 +2041,8 @@ def trend_lines(prober, tracker, cols, use_color, link_samples=(), part=None, se
         if use_color or n == 1:
             colors = [(SERIES_COLORS[i % 6] if i == mine else GREY) if mine is not None
                       else SERIES_COLORS[i % 6] for i in order]
-            chart = framed(line_chart([vals[i] for i in order], width, height, lo, hi, use_color, colors))
+            chart = framed(line_chart([vals[i] for i in order], width, height, lo, hi, use_color,
+                                      colors))
         else:      # no colors to tell lines apart: one small chart per series
             chart = []
             for ri, (label, _) in enumerate(rows):
@@ -2053,7 +2069,7 @@ def trend_lines(prober, tracker, cols, use_color, link_samples=(), part=None, se
                    if len(spread) >= 3 else "-")
             first_v = agg(v, first)[0] if not short else None
             last_v = agg(v, last)[0] if not short else None
-            key = color("──", SERIES_COLORS[ri % 6], True) if use_color else "  "
+            key = color("━━", SERIES_COLORS[ri % 6], True) if use_color else "  "
             row = f"{label[:lw]:<{lw}}{fmt(mean):>8}{rng:>18}{fmt(first_v):>9}{fmt(last_v):>8}"
             table.append(f"{key} " + (color(row, "1", use_color) + color(" ◀", "1", use_color)
                                       if ri == mine else row))
@@ -2378,9 +2394,10 @@ def render(prober, tracker, link_desc, wifi_now, started, use_color):
     elif tracker.view in (3, 4):
         part = "loss" if tracker.view == 3 else "tests"
         cache = getattr(tracker, "_trends", None)
-        if not cache or time.time() - cache[0] >= 10 or cache[1:4] != (cols, part, tracker.trend_sel):
-            cache = tracker._trends = (time.time(), cols, part, tracker.trend_sel, trend_lines(
-                prober, tracker, cols, use_color, wifi_now, part, tracker.trend_sel))
+        free = term_rows - len(lines) - 1      # below the headline: the charts fill it
+        if not cache or time.time() - cache[0] >= 10 or cache[1:4] != ((cols, free), part, tracker.trend_sel):
+            cache = tracker._trends = (time.time(), (cols, free), part, tracker.trend_sel, trend_lines(
+                prober, tracker, cols, use_color, wifi_now, part, tracker.trend_sel, free))
             tracker.trend_count = getattr(trend_lines, "count", 0)
         hint = ("↑/↓ highlight a line · Esc: all" if tracker.trend_sel is not None
                 else "↑/↓ highlight a line")
